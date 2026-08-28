@@ -1017,7 +1017,8 @@ class Graphiti:
         group_id : str | None
             An id for the graph partition the episode is a part of.
         uuid : str | None
-            Optional uuid of the episode.
+            Optional uuid of the episode. If an episode with this uuid already exists it is reprocessed;
+            otherwise the episode is created with this uuid.
         update_communities : bool
             Optional. Whether to update communities with new node information
         entity_types : dict[str, BaseModel] | None
@@ -1095,21 +1096,38 @@ class Graphiti:
                     else await EpisodicNode.get_by_uuids(self.driver, previous_episode_uuids)
                 )
 
-                # Get or create episode
-                episode = (
-                    await EpisodicNode.get_by_uuid(self.driver, uuid)
-                    if uuid is not None
-                    else EpisodicNode(
-                        name=name,
-                        group_id=group_id,
-                        labels=[],
-                        source=source,
-                        content=episode_body,
-                        source_description=source_description,
-                        created_at=now,
-                        valid_at=reference_time,
-                    )
-                )
+                # get or create the episode
+                # updated by dxb-software on 2026-08-28 to manually incorporate the fix from PR #1648
+                episode = None
+
+                if uuid is not None:
+
+                    try:
+
+                        episode = await EpisodicNode.get_by_uuid(self.driver, uuid)
+
+                    except NodeNotFoundError:
+
+                        logger.info(
+                            f"[GRAPHITI/ADD_EPISODE] Episode {uuid} not found in graph; "
+                            f"creating it with the supplied uuid"
+                        ) # logger
+
+                if episode is None:
+
+                    episode = EpisodicNode(
+                        name               = name,
+                        group_id           = group_id,
+                        labels             = [],
+                        source             = source,
+                        content            = episode_body,
+                        source_description = source_description,
+                        created_at         = now,
+                        valid_at           = reference_time,
+                    ) # episode
+
+                    if uuid is not None:
+                        episode.uuid = uuid
 
                 # Create default edge type map
                 edge_type_map_default = (
