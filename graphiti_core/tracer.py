@@ -146,14 +146,45 @@ class OpenTelemetryTracer(Tracer):
 
     @contextmanager
     def start_span(self, name: str) -> Generator[OpenTelemetrySpan | NoOpSpan, None, None]:
-        """Start a new OpenTelemetry span with the configured prefix."""
+        """Start a span without allowing tracing failures to mask application errors."""
+
+        full_name = f'{self._span_prefix}.{name}'
+
+        # only fall back to no-op when OpenTelemetry itself cannot start the span
         try:
-            full_name = f'{self._span_prefix}.{name}'
-            with self._tracer.start_as_current_span(full_name) as span:
-                yield OpenTelemetrySpan(span)
+            span_context = self._tracer.start_as_current_span(full_name)
+            span         = span_context.__enter__()
+
         except Exception:
-            # If tracing fails, yield a no-op span to prevent breaking the operation
             yield NoOpSpan()
+            return
+
+        try:
+            yield OpenTelemetrySpan(span)
+
+        except BaseException as error:
+
+            # report the original exception to OpenTelemetry, but never allow
+            # tracing cleanup to replace the application exception
+            try:
+                span_context.__exit__(
+                    type(error),
+                    error,
+                    error.__traceback__,
+                )
+
+            except Exception:
+                pass
+
+            raise
+
+        else:
+
+            try:
+                span_context.__exit__(None, None, None)
+
+            except Exception:
+                pass
 
 
 def create_tracer(otel_tracer: Any | None = None, span_prefix: str = 'graphiti') -> Tracer:
