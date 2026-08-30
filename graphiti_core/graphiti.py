@@ -995,6 +995,8 @@ class Graphiti:
         custom_extraction_instructions: str | None = None,
         saga: str | SagaNode | None = None,
         saga_previous_episode_uuid: str | None = None,
+        pre_extracted_nodes: list[EntityNode] | None = None,
+        pre_extracted_edges: list[EntityEdge] | None = None,
     ) -> AddEpisodeResults:
         """
         Process an episode and update the graph.
@@ -1071,6 +1073,19 @@ class Graphiti:
         validate_entity_types(entity_types)
         validate_excluded_entity_types(excluded_entity_types, entity_types)
 
+        using_pre_extracted = (
+            pre_extracted_nodes is not None
+            or pre_extracted_edges is not None
+        )
+
+        if using_pre_extracted and (
+            pre_extracted_nodes is None
+            or pre_extracted_edges is None
+        ):
+            raise ValueError(
+                'pre_extracted_nodes and pre_extracted_edges must be supplied together'
+            )
+
         if group_id is None:
             # if group_id is None, use the default group id by the provider
             # and the preset database name will be used
@@ -1136,15 +1151,33 @@ class Graphiti:
                     else {('Entity', 'Entity'): []}
                 )
 
-                # Extract and resolve nodes
-                extracted_nodes, node_episode_index_map = await extract_nodes(
-                    self.clients,
-                    episode,
-                    previous_episodes,
-                    entity_types,
-                    excluded_entity_types,
-                    custom_extraction_instructions,
-                )
+                # use caller-supplied semantic extraction when available;
+                # otherwise preserve Graphiti's normal LLM extraction behaviour
+                if pre_extracted_nodes is None:
+
+                    extracted_nodes, node_episode_index_map = await extract_nodes(
+                        self.clients,
+                        episode,
+                        previous_episodes,
+                        entity_types,
+                        excluded_entity_types,
+                        custom_extraction_instructions,
+                    )
+
+                else:
+
+                    extracted_nodes = [
+                        node.model_copy(deep=True)
+                        for node in pre_extracted_nodes
+                    ]
+
+                    for node in extracted_nodes:
+                        node.group_id = group_id
+
+                    node_episode_index_map = {
+                        node.uuid: [0]
+                        for node in extracted_nodes
+                    }
 
                 nodes, uuid_map, _ = await resolve_extracted_nodes(
                     self.clients,
@@ -1154,27 +1187,109 @@ class Graphiti:
                     entity_types,
                 )
 
-                # Extract and resolve edges in parallel with attribute extraction
-                (
-                    resolved_edges,
-                    invalidated_edges,
-                    new_edges,
-                ) = await self._extract_and_resolve_edges(
-                    episode,
-                    extracted_nodes,
-                    previous_episodes,
-                    edge_type_map or edge_type_map_default,
-                    group_id,
-                    edge_types,
-                    nodes,
-                    uuid_map,
-                    custom_extraction_instructions,
-                )
+                if pre_extracted_edges is None:
+
+                    (
+                        resolved_edges,
+                        invalidated_edges,
+                        new_edges,
+                    ) = await self._extract_and_resolve_edges(
+                        episode,
+                        extracted_nodes,
+                        previous_episodes,
+                        edge_type_map or edge_type_map_default,
+                        group_id,
+                        edge_types,
+                        nodes,
+                        uuid_map,
+                        custom_extraction_instructions,
+                    )
+
+                else:
+
+                    extracted_edges = [
+                        edge.model_copy(deep=True)
+                        for edge in pre_extracted_edges
+                    ]
+
+                    for edge in extracted_edges:
+
+                        edge.group_id = group_id
+                        edge.episodes = [episode.uuid]
+
+                        if edge.reference_time is None:
+                            edge.reference_time = reference_time
+
+                    resolved_input_edges = resolve_edge_pointers(
+                        extracted_edges,
+                        uuid_map,
+                    )
+
+                    (
+                        resolved_edges,
+                        invalidated_edges,
+                        new_edges,
+                    ) = await resolve_extracted_edges(
+                        self.clients,
+                        resolved_input_edges,
+                        episode,
+                        nodes,
+                        edge_types or {},
+                        edge_type_map or edge_type_map_default,
+                        preserve_existing_attributes=True,
+                    )
 
                 entity_edges = resolved_edges + invalidated_edges
 
-                # Extract node attributes - only pass new edges for summary generation
-                # to avoid duplicating facts that already exist in the graph
+                # merge attributes supplied by the external extractor onto canonical
+                # nodes after Graphiti has resolved aliases and duplicates
+                if pre_extracted_nodes is not None:
+
+                    resolved_nodes_by_uuid = {
+                        node.uuid: node
+                        for node in nodes
+                    }
+
+                    for extracted_node in extracted_nodes:
+
+                        resolved_uuid = uuid_map.get(
+                            extracted_node.uuid,
+                            extracted_node.uuid,
+                        )
+
+                        resolved_node = resolved_nodes_by_uuid.get(resolved_uuid)
+
+                        if resolved_node is None:
+                            continue
+
+                        resolved_node.attributes = dict(
+                            resolved_node.attributes or {}
+                        )
+
+                        for key, value in extracted_node.attributes.items():
+
+                            if key == 'extraction_score':
+
+                                existing_score = resolved_node.attributes.get(key)
+
+                                try:
+
+                                    if (
+                                        existing_score is None
+                                        or float(value) > float(existing_score)
+                                    ):
+                                        resolved_node.attributes[key] = value
+
+                                except (TypeError, ValueError):
+
+                                    resolved_node.attributes[key] = value
+
+                            else:
+
+                                resolved_node.attributes[key] = value
+
+                # GLiNER already supplied entity attributes in the pre-extracted path;
+                # retain Graphiti summaries and embeddings but do not ask Qwen to re-extract them
                 hydrated_nodes = await extract_attributes_from_nodes(
                     self.clients,
                     nodes,
@@ -1182,6 +1297,7 @@ class Graphiti:
                     previous_episodes,
                     entity_types,
                     edges=new_edges,
+                    extract_attributes=pre_extracted_nodes is None,
                 )
 
                 # Process and save episode data (including saga association if provided)

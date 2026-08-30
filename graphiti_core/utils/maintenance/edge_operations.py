@@ -36,7 +36,7 @@ from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
 from graphiti_core.prompts import prompt_library
 from graphiti_core.prompts.dedupe_edges import EdgeDuplicate
 from graphiti_core.prompts.extract_edges import Edge as ExtractedEdge
-from graphiti_core.prompts.extract_edges import EdgeTimestamps, ExtractedEdges
+from graphiti_core.prompts.extract_edges import BatchEdgeTimestamps, EdgeTimestamps, ExtractedEdges
 from graphiti_core.search.search import search
 from graphiti_core.search.search_config import SearchResults
 from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
@@ -330,6 +330,7 @@ async def resolve_extracted_edges(
     edge_types: dict[str, type[BaseModel]],
     edge_type_map: dict[tuple[str, str], list[str]],
     existing_edges_override: list[EntityEdge] | None = None,
+    preserve_existing_attributes: bool = False,
 ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
     """Resolve extracted edges against existing graph context.
 
@@ -357,9 +358,17 @@ async def resolve_extracted_edges(
 
     extracted_edges = deduplicated_edges
 
-    driver = clients.driver
+    driver     = clients.driver
     llm_client = clients.llm_client
-    embedder = clients.embedder
+    embedder   = clients.embedder
+
+    # resolve missing temporal bounds in one LLM call rather than one call per edge
+    await _extract_edge_timestamps_batch(
+        llm_client,
+        extracted_edges,
+        episode,
+    )
+
     await create_entity_edge_embeddings(embedder, extracted_edges)
 
     valid_edges_list: list[list[EntityEdge]] = await semaphore_gather(
@@ -496,6 +505,8 @@ async def resolve_extracted_edges(
                     existing_edges,
                     episode,
                     extracted_edge_types,
+                    extract_timestamps=False,
+                    preserve_existing_attributes=preserve_existing_attributes,
                 )
                 for extracted_edge, related_edges, existing_edges, extracted_edge_types in zip(
                     extracted_edges,
@@ -620,6 +631,97 @@ async def _extract_edge_timestamps(
         logger.warning('Failed to extract timestamps for edge %s', edge.uuid, exc_info=True)
 
 
+async def _extract_edge_timestamps_batch(
+    llm_client: LLMClient,
+    edges: list[EntityEdge],
+    episode: EpisodicNode | None,
+) -> None:
+    """Extract missing temporal bounds for multiple edges in one LLM call."""
+
+    if episode is None or episode.valid_at is None:
+        return
+
+    missing_edges = [
+        edge
+        for edge in edges
+        if edge.valid_at is None and edge.invalid_at is None
+    ]
+
+    if not missing_edges:
+        return
+
+    context = {
+        'facts': [
+            {
+                'fact': edge.fact,
+                'reference_time': episode.valid_at.isoformat(),
+            }
+            for edge in missing_edges
+        ],
+    }
+
+    try:
+
+        llm_response = await llm_client.generate_response(
+            prompt_library.extract_edges.extract_timestamps_batch(context),
+            response_model=BatchEdgeTimestamps,
+            model_size=ModelSize.small,
+            prompt_name='extract_edges.extract_timestamps_batch',
+        )
+
+        timestamps = BatchEdgeTimestamps(**llm_response).timestamps
+
+        if len(timestamps) != len(missing_edges):
+
+            logger.warning(
+                f'Batch timestamp extraction returned {len(timestamps)} results '
+                f'for {len(missing_edges)} edges; leaving temporal bounds unset'
+            )
+
+            return
+
+        for edge, temporal_bounds in zip(missing_edges, timestamps, strict=True):
+
+            if temporal_bounds.valid_at:
+
+                try:
+
+                    edge.valid_at = ensure_utc(
+                        datetime.fromisoformat(
+                            temporal_bounds.valid_at.replace('Z', '+00:00')
+                        )
+                    )
+
+                except ValueError:
+
+                    logger.debug(
+                        f'Error parsing valid_at: {temporal_bounds.valid_at}'
+                    )
+
+            if temporal_bounds.invalid_at:
+
+                try:
+
+                    edge.invalid_at = ensure_utc(
+                        datetime.fromisoformat(
+                            temporal_bounds.invalid_at.replace('Z', '+00:00')
+                        )
+                    )
+
+                except ValueError:
+
+                    logger.debug(
+                        f'Error parsing invalid_at: {temporal_bounds.invalid_at}'
+                    )
+
+    except Exception:
+
+        logger.warning(
+            'Failed to extract timestamps for edge batch',
+            exc_info=True,
+        )
+
+
 async def resolve_extracted_edge(
     llm_client: LLMClient,
     extracted_edge: EntityEdge,
@@ -627,6 +729,9 @@ async def resolve_extracted_edge(
     existing_edges: list[EntityEdge],
     episode: EpisodicNode,
     edge_type_candidates: dict[str, type[BaseModel]] | None = None,
+    *,
+    extract_timestamps: bool = True,
+    preserve_existing_attributes: bool = False,
 ) -> tuple[EntityEdge, list[EntityEdge], list[EntityEdge]]:
     """Resolve an extracted edge against existing graph context.
 
@@ -677,7 +782,8 @@ async def resolve_extracted_edge(
             )
             extracted_edge.attributes = merged
 
-        await _extract_edge_timestamps(llm_client, extracted_edge, episode)
+        if extract_timestamps:
+            await _extract_edge_timestamps(llm_client, extracted_edge, episode)
 
         return extracted_edge, [], []
 
@@ -690,8 +796,17 @@ async def resolve_extracted_edge(
             and _normalize_string_exact(edge.fact) == normalized_fact
         ):
             resolved = edge
+
+            if preserve_existing_attributes:
+
+                resolved.attributes = {
+                    **dict(resolved.attributes or {}),
+                    **dict(extracted_edge.attributes or {}),
+                }
+
             if episode is not None and episode.uuid not in resolved.episodes:
                 resolved.episodes.append(episode.uuid)
+
             return resolved, [], []
 
     start = time()
@@ -751,6 +866,15 @@ async def resolve_extracted_edge(
     if duplicate_fact_ids and episode is not None:
         resolved_edge.episodes.append(episode.uuid)
 
+    if (
+        preserve_existing_attributes
+        and resolved_edge.uuid != extracted_edge.uuid
+    ):
+        resolved_edge.attributes = {
+            **dict(resolved_edge.attributes or {}),
+            **dict(extracted_edge.attributes or {}),
+        }
+
     # Process contradicted facts (continuous indexing across both lists)
     contradicted_facts: list[int] = response_object.contradicted_facts
     invalidation_candidates: list[EntityEdge] = []
@@ -804,12 +928,15 @@ async def resolve_extracted_edge(
         )
         resolved_edge.attributes = merged
     else:
-        # No matching edge schema → no structured attributes apply; clear any stale
-        # attributes left from a prior schema. Intentionally not merged.
-        resolved_edge.attributes = {}
 
-    # Extract timestamps for new edges (duplicated edges retain their existing timestamps)
-    if resolved_edge.uuid == extracted_edge.uuid:
+        # the standard Graphiti path retains its existing stale-attribute behaviour;
+        # externally extracted edges keep the validated attributes supplied by their extractor
+        if not preserve_existing_attributes:
+            resolved_edge.attributes = {}
+
+    # direct callers retain the single-edge fallback; resolve_extracted_edges()
+    # already performed the batched temporal pass
+    if extract_timestamps and resolved_edge.uuid == extracted_edge.uuid:
         await _extract_edge_timestamps(llm_client, resolved_edge, episode)
 
     end = time()

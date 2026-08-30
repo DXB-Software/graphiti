@@ -733,6 +733,7 @@ async def extract_attributes_from_nodes(
     edges: list[EntityEdge] | None = None,
     skip_fact_appending: bool = False,
     include_type_descriptions: bool = False,
+    extract_attributes: bool = True,
 ) -> list[EntityNode]:
     llm_client = clients.llm_client
     embedder = clients.embedder
@@ -740,28 +741,32 @@ async def extract_attributes_from_nodes(
     # Pre-build edges lookup for O(E + N) instead of O(N * E)
     edges_by_node = _build_edges_by_node(edges)
 
-    # Extract attributes in parallel (per-entity calls)
-    attribute_results: list[dict[str, Any]] = await semaphore_gather(
-        *[
-            _extract_entity_attributes(
-                llm_client,
-                node,
-                episode,
-                previous_episodes,
-                (
-                    entity_types.get(next((item for item in node.labels if item != 'Entity'), ''))
-                    if entity_types is not None
-                    else None
-                ),
-            )
-            for node in nodes
-        ]
-    )
+    # pre-extracted nodes may already contain trusted extractor attributes;
+    # skip the per-entity LLM attribute pass when the caller supplied them
+    if extract_attributes:
 
-    # _extract_entity_attributes returns the already-merged attribute dict
-    # (overlay of prior + cap-kept fields), so direct assignment is the merge.
-    for node, attributes in zip(nodes, attribute_results, strict=True):
-        node.attributes = attributes
+        attribute_results: list[dict[str, Any]] = await semaphore_gather(
+            *[
+                _extract_entity_attributes(
+                    llm_client,
+                    node,
+                    episode,
+                    previous_episodes,
+                    (
+                        entity_types.get(
+                            next((item for item in node.labels if item != 'Entity'), '')
+                        )
+                        if entity_types is not None
+                        else None
+                    ),
+                )
+                for node in nodes
+            ]
+        )
+
+        # _extract_entity_attributes returns the already-merged attribute dict
+        for node, attributes in zip(nodes, attribute_results, strict=True):
+            node.attributes = attributes
 
     # Extract summaries in batch
     await _extract_entity_summaries_batch(
