@@ -34,6 +34,11 @@ def _saga_node_from_record(record: Any) -> SagaNode:
         name=record['name'],
         group_id=record['group_id'],
         created_at=parse_db_date(record['created_at']),  # type: ignore[arg-type]
+        summary=record.get('summary') or '',
+        first_episode_uuid=record.get('first_episode_uuid'),
+        last_episode_uuid=record.get('last_episode_uuid'),
+        last_summarized_at=parse_db_date(record.get('last_summarized_at')),
+        last_summarized_episode_valid_at=parse_db_date(record.get('last_summarized_episode_valid_at')),
     )
 
 
@@ -50,6 +55,11 @@ class Neo4jSagaNodeOperations(SagaNodeOperations):
             'name': node.name,
             'group_id': node.group_id,
             'created_at': node.created_at,
+            'summary': node.summary,
+            'first_episode_uuid': node.first_episode_uuid,
+            'last_episode_uuid': node.last_episode_uuid,
+            'last_summarized_at': node.last_summarized_at,
+            'last_summarized_episode_valid_at': node.last_summarized_episode_valid_at,
         }
         if tx is not None:
             await tx.run(query, **params)

@@ -680,13 +680,11 @@ class Graphiti:
             routing_='r',
         )
 
+        # edited by David Williamson 2026-09-01
         if records:
-            record = records[0]
-            return SagaNode(
-                uuid=record['uuid'],
-                name=record['name'],
-                group_id=record['group_id'],
-                created_at=parse_db_date(record['created_at']),  # type: ignore
+            return await SagaNode.get_by_uuid(
+                self.driver,
+                records[0]['uuid'],
             )
 
         saga = SagaNode(name=saga_name, group_id=group_id, created_at=created_at)
@@ -1048,37 +1046,53 @@ class Graphiti:
             else:
                 saga_node = saga
 
-            # Use provided previous episode UUID or query for it
-            previous_episode_uuid: str | None = saga_previous_episode_uuid
-            if previous_episode_uuid is None:
-                previous_episode_uuid = await self._saga_get_previous_episode_uuid(
-                    saga_node.uuid, primary_episode.uuid
-                )
+            records, _, _ = await self.driver.execute_query(
+                """
+                MATCH (s:Saga {uuid: $saga_uuid})
+                OPTIONAL MATCH (s)-[:HAS_EPISODE]->(e:Episodic {uuid: $episode_uuid})
+                RETURN count(e) > 0 AS already_attached
+                """,
+                saga_uuid=saga_node.uuid,
+                episode_uuid=primary_episode.uuid,
+                routing_='r',
+            )
 
-            # Create NEXT_EPISODE edge from the previous episode to the new one
-            if previous_episode_uuid is not None:
-                next_episode_edge = NextEpisodeEdge(
-                    source_node_uuid=previous_episode_uuid,
+            already_attached = bool(
+                records and records[0]['already_attached']
+            )
+
+            if not already_attached:
+
+                previous_episode_uuid: str | None = saga_previous_episode_uuid
+
+                if previous_episode_uuid is None:
+                    previous_episode_uuid = await self._saga_get_previous_episode_uuid(
+                        saga_node.uuid,
+                        primary_episode.uuid,
+                    )
+
+                if previous_episode_uuid is not None:
+                    next_episode_edge = NextEpisodeEdge(
+                        source_node_uuid=previous_episode_uuid,
+                        target_node_uuid=primary_episode.uuid,
+                        group_id=group_id,
+                        created_at=now,
+                    )
+                    await next_episode_edge.save(self.driver)
+
+                has_episode_edge = HasEpisodeEdge(
+                    source_node_uuid=saga_node.uuid,
                     target_node_uuid=primary_episode.uuid,
                     group_id=group_id,
                     created_at=now,
                 )
-                await next_episode_edge.save(self.driver)
+                await has_episode_edge.save(self.driver)
 
-            # Create HAS_EPISODE edge from saga to the new episode
-            has_episode_edge = HasEpisodeEdge(
-                source_node_uuid=saga_node.uuid,
-                target_node_uuid=primary_episode.uuid,
-                group_id=group_id,
-                created_at=now,
-            )
-            await has_episode_edge.save(self.driver)
+                if saga_node.first_episode_uuid is None:
+                    saga_node.first_episode_uuid = primary_episode.uuid
 
-            # Track first and last episode on the saga node
-            if saga_node.first_episode_uuid is None:
-                saga_node.first_episode_uuid = primary_episode.uuid
-            saga_node.last_episode_uuid = primary_episode.uuid
-            await saga_node.save(self.driver)
+                saga_node.last_episode_uuid = primary_episode.uuid
+                await saga_node.save(self.driver)
 
         return episodic_edges, primary_episode
 
@@ -2246,11 +2260,36 @@ class Graphiti:
         # Find edges mentioned by the episode
         edges = await EntityEdge.get_by_uuids(self.driver, episode.entity_edges)
 
-        # We should only delete edges created by the episode
         edges_to_delete: list[EntityEdge] = []
+
         for edge in edges:
-            if edge.episodes and edge.episodes[0] == episode.uuid:
+
+            if episode.uuid not in edge.episodes:
+                continue
+
+            removed_primary_provenance = edge.episodes[0] == episode.uuid
+
+            edge.episodes = [
+                supporting_episode_uuid
+                for supporting_episode_uuid in edge.episodes
+                if supporting_episode_uuid != episode.uuid
+            ]
+
+            if not edge.episodes:
                 edges_to_delete.append(edge)
+                continue
+
+            if removed_primary_provenance:
+                replacement_episode = await EpisodicNode.get_by_uuid(
+                    self.driver,
+                    edge.episodes[0],
+                )
+
+                edge.created_at = replacement_episode.created_at
+                edge.reference_time = replacement_episode.valid_at
+
+            await edge.load_fact_embedding(self.driver)
+            await edge.save(self.driver)
 
         # Find nodes mentioned by the episode
         nodes = await get_mentioned_nodes(self.driver, [episode])

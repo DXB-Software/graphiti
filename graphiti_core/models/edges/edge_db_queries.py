@@ -304,16 +304,18 @@ COMMUNITY_EDGE_RETURN = """
     e.created_at AS created_at
 """
 
-
+# edited by David Williamson 2026-09-01
 HAS_EPISODE_EDGE_SAVE = """
     MATCH (saga:Saga {uuid: $saga_uuid})
     MATCH (episode:Episodic {uuid: $episode_uuid})
-    MERGE (saga)-[e:HAS_EPISODE {uuid: $uuid}]->(episode)
-    SET
-        e.group_id = $group_id,
+    MERGE (saga)-[e:HAS_EPISODE]->(episode)
+    ON CREATE SET
+        e.uuid = $uuid,
         e.created_at = $created_at
+    SET e.group_id = $group_id
     RETURN e.uuid AS uuid
 """
+
 
 HAS_EPISODE_EDGE_RETURN = """
     e.uuid AS uuid,
@@ -323,14 +325,15 @@ HAS_EPISODE_EDGE_RETURN = """
     e.created_at AS created_at
 """
 
-
+# edited by David Williamson 2026-09-01
 NEXT_EPISODE_EDGE_SAVE = """
     MATCH (source_episode:Episodic {uuid: $source_episode_uuid})
     MATCH (target_episode:Episodic {uuid: $target_episode_uuid})
-    MERGE (source_episode)-[e:NEXT_EPISODE {uuid: $uuid}]->(target_episode)
-    SET
-        e.group_id = $group_id,
+    MERGE (source_episode)-[e:NEXT_EPISODE]->(target_episode)
+    ON CREATE SET
+        e.uuid = $uuid,
         e.created_at = $created_at
+    SET e.group_id = $group_id
     RETURN e.uuid AS uuid
 """
 
