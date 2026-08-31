@@ -134,7 +134,50 @@ class AddTripletResults(BaseModel):
     edges: list[EntityEdge]
 
 
+# added by David Williamson 2026-08-31
+class SagaSnapshotResults(BaseModel):
+    exists: bool
+    episode_ids: list[str]
+    sequence_edge_count: int
+    entity_count: int
+    relationship_count: int
+
+
+# added by David Williamson 2026-08-31
+class EpisodeStructureResults(BaseModel):
+    episode_uuid: str
+    saga_name: str | None
+    previous_episode_uuid: str | None
+    next_episode_uuid: str | None
+
+
+# added by David Williamson 2026-08-31
+class EntityInspectionResults(BaseModel):
+    uuid: str
+    name: str | None
+    summary: str | None
+    labels: list[str]
+    properties: dict
+
+
+# added by David Williamson 2026-08-31
+class EntityRelationshipInspectionResults(BaseModel):
+    edge_uuid: str
+    relationship_type: str
+    fact: str
+    source_node_uuid: str
+    target_node_uuid: str
+    related_node_uuid: str
+    related_node_name: str | None
+    episode_ids: list[str]
+    valid_at: datetime | None
+    invalid_at: datetime | None
+    created_at: datetime
+    expired_at: datetime | None
+
+
 class Graphiti:
+    
     def __init__(
         self,
         uri: str | None = None,
@@ -342,6 +385,265 @@ class Graphiti:
                 graphiti.close()
         """
         await self.driver.close()
+
+    # added by David Williamson 2026-08-31
+    async def health_check(self) -> bool:
+        """Return True when the graph database accepts a read query."""
+
+        try:
+            records, _, _ = await self.driver.execute_query(
+                'RETURN 1 AS ok',
+                routing_='r',
+            )
+
+            return bool(records)
+
+        except Exception as e:
+            logger.warning('Graph database health check failed: %s', e)
+            return False
+
+    # added by David Williamson 2026-08-31
+    async def initialise(self) -> None:
+        """Wait for any pending graph database initialisation to complete."""
+
+        init_task = getattr(self.driver, "_init_task", None)
+
+        if init_task is not None:
+            await init_task
+
+    # added by David Williamson 2026-08-31
+    async def clear(self) -> None:
+        """Delete all graph data while retaining indexes and constraints."""
+
+        await self.driver.graph_ops.clear_data(self.driver)
+
+    # added by David Williamson 2026-08-31
+    async def get_saga_snapshot(self, saga_name: str) -> SagaSnapshotResults:
+        """Return structural and semantic counts for one Saga."""
+
+        records, _, _ = await self.driver.execute_query(
+            """
+            MATCH (s:Saga {name: $saga_name})
+            OPTIONAL MATCH (s)-[:HAS_EPISODE]->(episode:Episodic)
+            WITH s, collect(DISTINCT episode.uuid) AS episode_ids
+
+            OPTIONAL MATCH
+                (source_episode:Episodic)-[sequence:NEXT_EPISODE]->(target_episode:Episodic)
+            WHERE source_episode.uuid IN episode_ids
+              AND target_episode.uuid IN episode_ids
+
+            WITH s, episode_ids, count(DISTINCT sequence) AS sequence_edge_count
+
+            OPTIONAL MATCH (mentioned_episode:Episodic)-[:MENTIONS]->(entity:Entity)
+            WHERE mentioned_episode.uuid IN episode_ids
+
+            WITH s,
+                 episode_ids,
+                 sequence_edge_count,
+                 collect(DISTINCT entity.uuid) AS entity_ids
+
+            OPTIONAL MATCH (:Entity)-[edge:RELATES_TO]->(:Entity)
+            WHERE any(
+                episode_id IN episode_ids
+                WHERE episode_id IN coalesce(edge.episodes, [])
+            )
+
+            RETURN episode_ids,
+                   sequence_edge_count,
+                   entity_ids,
+                   collect(DISTINCT edge.uuid) AS edge_ids
+            """,
+            saga_name=saga_name,
+            routing_='r',
+        )
+
+        if not records:
+            return SagaSnapshotResults(
+                exists=False,
+                episode_ids=[],
+                sequence_edge_count=0,
+                entity_count=0,
+                relationship_count=0,
+            )
+
+        record = records[0]
+
+        episode_ids = [
+            str(value)
+            for value in record.get('episode_ids') or []
+            if value
+        ]
+        entity_ids = [
+            str(value)
+            for value in record.get('entity_ids') or []
+            if value
+        ]
+        edge_ids = [
+            str(value)
+            for value in record.get('edge_ids') or []
+            if value
+        ]
+
+        return SagaSnapshotResults(
+            exists=True,
+            episode_ids=episode_ids,
+            sequence_edge_count=int(record.get('sequence_edge_count') or 0),
+            entity_count=len(entity_ids),
+            relationship_count=len(edge_ids),
+        )
+
+    # added by David Williamson 2026-08-31
+    async def get_episode_structure(
+        self,
+        episode_uuid: str,
+    ) -> EpisodeStructureResults | None:
+        """Return Saga and sequence information for one episode."""
+
+        records, _, _ = await self.driver.execute_query(
+            """
+            MATCH (current:Episodic {uuid: $episode_uuid})
+            OPTIONAL MATCH (s:Saga)-[:HAS_EPISODE]->(current)
+            OPTIONAL MATCH (previous:Episodic)-[:NEXT_EPISODE]->(current)
+            OPTIONAL MATCH (current)-[:NEXT_EPISODE]->(next:Episodic)
+            RETURN current.uuid AS episode_uuid,
+                   s.name AS saga_name,
+                   previous.uuid AS previous_episode_uuid,
+                   next.uuid AS next_episode_uuid
+            """,
+            episode_uuid=episode_uuid,
+            routing_='r',
+        )
+
+        if not records:
+            return None
+
+        record = records[0]
+
+        return EpisodeStructureResults(
+            episode_uuid=str(record['episode_uuid']),
+            saga_name=record.get('saga_name'),
+            previous_episode_uuid=record.get('previous_episode_uuid'),
+            next_episode_uuid=record.get('next_episode_uuid'),
+        )
+
+    # added by David Williamson 2026-08-31
+    async def list_entities(
+        self,
+        limit: int = 50,
+    ) -> list[EntityInspectionResults]:
+        """Return Entity nodes for graph inspection."""
+
+        records, _, _ = await self.driver.execute_query(
+            """
+            MATCH (entity:Entity)
+            RETURN entity.uuid AS uuid,
+                   entity.name AS name,
+                   entity.summary AS summary,
+                   labels(entity) AS labels,
+                   properties(entity) AS properties
+            ORDER BY coalesce(entity.name, '')
+            LIMIT $limit
+            """,
+            limit=limit,
+            routing_='r',
+        )
+
+        return [
+            EntityInspectionResults(
+                uuid=str(record['uuid']),
+                name=record.get('name'),
+                summary=record.get('summary'),
+                labels=list(record.get('labels') or []),
+                properties=dict(record.get('properties') or {}),
+            )
+            for record in records
+        ]
+
+    # added by David Williamson 2026-08-31
+    async def get_entity_relationships(
+        self,
+        node_uuid: str,
+    ) -> list[EntityRelationshipInspectionResults]:
+        """Return semantic relationships connected to one Entity."""
+
+        edges = await EntityEdge.get_by_node_uuid(
+            self.driver,
+            node_uuid,
+        )
+
+        related_node_uuids = [
+            (
+                edge.target_node_uuid
+                if edge.source_node_uuid == node_uuid
+                else edge.source_node_uuid
+            )
+            for edge in edges
+        ]
+
+        related_nodes = await EntityNode.get_by_uuids(
+            self.driver,
+            list(set(related_node_uuids)),
+        )
+
+        related_nodes_by_uuid = {
+            str(node.uuid): node
+            for node in related_nodes
+        }
+
+        results = []
+
+        for edge, related_node_uuid in zip(
+            edges,
+            related_node_uuids,
+            strict=True,
+        ):
+            related_node = related_nodes_by_uuid.get(str(related_node_uuid))
+
+            results.append(
+                EntityRelationshipInspectionResults(
+                    edge_uuid=str(edge.uuid),
+                    relationship_type=edge.name,
+                    fact=edge.fact,
+                    source_node_uuid=str(edge.source_node_uuid),
+                    target_node_uuid=str(edge.target_node_uuid),
+                    related_node_uuid=str(related_node_uuid),
+                    related_node_name=(
+                        related_node.name
+                        if related_node is not None
+                        else None
+                    ),
+                    episode_ids=[
+                        str(episode_id)
+                        for episode_id in edge.episodes
+                    ],
+                    valid_at=edge.valid_at,
+                    invalid_at=edge.invalid_at,
+                    created_at=edge.created_at,
+                    expired_at=edge.expired_at,
+                )
+            )
+
+        results.sort(
+            key=lambda result: (
+                result.relationship_type or "",
+                result.related_node_name or "",
+            )
+        )
+
+        return results
+
+    # added by David Williamson 2026-08-31
+    async def remove_saga_if_empty(self, saga_name: str) -> None:
+        """Remove a Saga when it no longer contains any episodes."""
+
+        await self.driver.execute_query(
+            """
+            MATCH (s:Saga {name: $saga_name})
+            WHERE NOT (s)-[:HAS_EPISODE]->(:Episodic)
+            DETACH DELETE s
+            """,
+            saga_name=saga_name,
+        )
 
     async def _get_or_create_saga(
         self, saga_name: str, group_id: str, created_at: datetime
