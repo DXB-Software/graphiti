@@ -1776,6 +1776,47 @@ class Graphiti:
 
         return SearchResults(edges=edges, nodes=nodes)
 
+    # added by David Williamson 2026-08-31
+    async def get_nodes_and_edges_by_saga(
+        self,
+        saga_names: list[str],
+        group_ids: list[str] | None = None,
+    ) -> SearchResults:
+        """Return the semantic subgraph and episode provenance for the requested Sagas."""
+
+        if not saga_names:
+            return SearchResults()
+
+        episodes = await self.nodes.episode.get_by_saga_names(
+            saga_names,
+            group_ids,
+        )
+
+        if not episodes:
+            return SearchResults()
+
+        results = await self.get_nodes_and_edges_by_episode(
+            [episode.uuid for episode in episodes]
+        )
+
+        # an entity or fact can be referenced by more than one episode, so
+        # return each semantic object only once while retaining episode provenance
+        nodes_by_uuid = {
+            node.uuid: node
+            for node in results.nodes
+        }
+
+        edges_by_uuid = {
+            edge.uuid: edge
+            for edge in results.edges
+        }
+
+        return SearchResults(
+            edges=list(edges_by_uuid.values()),
+            nodes=list(nodes_by_uuid.values()),
+            episodes=episodes,
+        )
+
     async def add_triplet(
         self, source_node: EntityNode, edge: EntityEdge, target_node: EntityNode
     ) -> AddTripletResults:

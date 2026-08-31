@@ -167,6 +167,66 @@ class FalkorEpisodeNodeOperations(EpisodeNodeOperations):
         records, _, _ = await executor.execute_query(query, uuids=uuids)
         return [episodic_node_from_record(r) for r in records]
 
+    # added by David Williamson 2026-08-31
+    async def get_by_saga_names(
+        self,
+        executor: QueryExecutor,
+        saga_names: list[str],
+        group_ids: list[str] | None = None,
+    ) -> list[EpisodicNode]:
+
+        # FalkorDB stores each group in a separate graph database, so fan out
+        # across the requested groups before executing the Saga lookup
+        if (
+            isinstance(executor, GraphDriver)
+            and executor.provider == GraphProvider.FALKORDB
+            and group_ids
+        ):
+
+            episodes_by_uuid = {}
+
+            for group_id in group_ids:
+
+                partial = await self.get_by_saga_names(
+                    executor.clone(database=group_id),
+                    saga_names,
+                    None,
+                )
+
+                for episode in partial:
+                    episodes_by_uuid[episode.uuid] = episode
+
+            episodes = list(episodes_by_uuid.values())
+
+            episodes.sort(
+                key=lambda episode: (
+                    episode.valid_at,
+                    episode.created_at,
+                    episode.uuid,
+                )
+            )
+
+            return episodes
+
+        query = (
+            """
+            MATCH (s:Saga)-[:HAS_EPISODE]->(e:Episodic)
+            WHERE s.name IN $saga_names
+            RETURN DISTINCT
+            """
+            + EPISODIC_NODE_RETURN
+            + """
+            ORDER BY e.valid_at ASC, e.created_at ASC, e.uuid ASC
+            """
+        )
+
+        records, _, _ = await executor.execute_query(
+            query,
+            saga_names=saga_names,
+        )
+
+        return [episodic_node_from_record(record) for record in records]
+
     async def get_by_group_ids(
         self,
         executor: QueryExecutor,

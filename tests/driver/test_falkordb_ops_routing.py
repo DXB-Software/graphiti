@@ -117,3 +117,131 @@ async def test_get_by_group_ids_empty_group_ids_does_not_route():
 
     base.clone.assert_not_called()
     base.execute_query.assert_awaited_once()
+
+
+async def test_episode_get_by_saga_names_multi_group_fans_out_per_graph():
+    """Saga lookup must query each requested group graph and aggregate the results."""
+
+    ops = FalkorEpisodeNodeOperations()
+
+    base = MagicMock(spec=GraphDriver)
+    base.provider = GraphProvider.FALKORDB
+    base.execute_query = AsyncMock(return_value=([], None, None))
+
+    clones = {}
+
+    def _clone(database):
+        child = MagicMock(spec=GraphDriver)
+        child.provider = GraphProvider.FALKORDB
+        child.execute_query = AsyncMock(return_value=([], None, None))
+        clones[database] = child
+        return child
+
+    base.clone = MagicMock(side_effect=_clone)
+
+    result = await ops.get_by_saga_names(
+        base,
+        ['saga-1', 'saga-2'],
+        ['group-a', 'group-b'],
+    )
+
+    assert result == []
+
+    assert sorted(clones) == [
+        'group-a',
+        'group-b',
+    ]
+
+    base.execute_query.assert_not_called()
+
+    for child in clones.values():
+        child.execute_query.assert_awaited_once()
+
+        query = child.execute_query.await_args.args[0]
+        kwargs = child.execute_query.await_args.kwargs
+
+        assert 'MATCH (s:Saga)-[:HAS_EPISODE]->(e:Episodic)' in query
+        assert 'WHERE s.name IN $saga_names' in query
+        assert 's.group_id IN $group_ids' not in query
+        assert kwargs['saga_names'] == [
+            'saga-1',
+            'saga-2',
+        ]
+
+
+async def test_episode_get_by_saga_names_deduplicates_and_orders_across_groups(monkeypatch):
+    """Episodes returned from multiple group graphs must be deduplicated and ordered."""
+
+    ops = FalkorEpisodeNodeOperations()
+
+    base = MagicMock(spec=GraphDriver)
+    base.provider = GraphProvider.FALKORDB
+    base.execute_query = AsyncMock(return_value=([], None, None))
+
+    records_by_database = {
+        'group-a': [
+            {
+                'uuid': 'episode-3',
+                'valid_at': 3,
+                'created_at': 3,
+            },
+            {
+                'uuid': 'episode-1',
+                'valid_at': 1,
+                'created_at': 1,
+            },
+        ],
+        'group-b': [
+            {
+                'uuid': 'episode-2',
+                'valid_at': 2,
+                'created_at': 2,
+            },
+            {
+                'uuid': 'episode-1',
+                'valid_at': 1,
+                'created_at': 1,
+            },
+        ],
+    }
+
+    def _clone(database):
+        child = MagicMock(spec=GraphDriver)
+        child.provider = GraphProvider.FALKORDB
+        child.execute_query = AsyncMock(
+            return_value=(
+                records_by_database[database],
+                None,
+                None,
+            )
+        )
+        return child
+
+    base.clone = MagicMock(side_effect=_clone)
+
+    def _parse_episode(record):
+        episode = MagicMock()
+        episode.uuid = record['uuid']
+        episode.valid_at = record['valid_at']
+        episode.created_at = record['created_at']
+        return episode
+
+    monkeypatch.setattr(
+        'graphiti_core.driver.falkordb.operations.episode_node_ops.episodic_node_from_record',
+        _parse_episode,
+    )
+
+    results = await ops.get_by_saga_names(
+        base,
+        ['saga-1'],
+        ['group-a', 'group-b'],
+    )
+
+    assert [episode.uuid for episode in results] == [
+        'episode-1',
+        'episode-2',
+        'episode-3',
+    ]
+
+    assert len(results) == 3
+    base.execute_query.assert_not_called()

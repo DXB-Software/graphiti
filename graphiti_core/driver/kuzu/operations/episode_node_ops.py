@@ -155,6 +155,38 @@ class KuzuEpisodeNodeOperations(EpisodeNodeOperations):
         records, _, _ = await executor.execute_query(query, uuids=uuids)
         return [episodic_node_from_record(r) for r in records]
 
+    # added by David Williamson 2026-08-31
+    async def get_by_saga_names(
+        self,
+        executor: QueryExecutor,
+        saga_names: list[str],
+        group_ids: list[str] | None = None,
+    ) -> list[EpisodicNode]:
+        group_clause = 'AND s.group_id IN $group_ids' if group_ids else ''
+
+        query = (
+            """
+            MATCH (s:Saga)-[:HAS_EPISODE]->(e:Episodic)
+            WHERE s.name IN $saga_names
+            """
+            + group_clause
+            + """
+            RETURN DISTINCT
+            """
+            + EPISODIC_NODE_RETURN
+            + """
+            ORDER BY e.valid_at ASC, e.created_at ASC, e.uuid ASC
+            """
+        )
+
+        records, _, _ = await executor.execute_query(
+            query,
+            saga_names=saga_names,
+            group_ids=group_ids,
+        )
+
+        return [episodic_node_from_record(record) for record in records]
+
     async def get_by_group_ids(
         self,
         executor: QueryExecutor,

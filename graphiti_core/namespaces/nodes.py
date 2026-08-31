@@ -156,6 +156,18 @@ class EpisodeNodeNamespace:
     async def get_by_uuids(self, uuids: list[str]) -> list[EpisodicNode]:
         return await self._ops.get_by_uuids(self._driver, uuids)
 
+    # added by David Williamson 2026-08-31
+    async def get_by_saga_names(
+        self,
+        saga_names: list[str],
+        group_ids: list[str] | None = None,
+    ) -> list[EpisodicNode]:
+        return await self._ops.get_by_saga_names(
+            self._driver,
+            saga_names,
+            group_ids,
+        )
+
     async def get_by_group_ids(
         self,
         group_ids: list[str],

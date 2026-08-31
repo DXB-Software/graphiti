@@ -79,6 +79,15 @@ class EpisodeNodeOperations(ABC):
         uuids: list[str],
     ) -> list[EpisodicNode]: ...
 
+    # added by David Williamson 2026-08-31
+    @abstractmethod
+    async def get_by_saga_names(
+        self,
+        executor: QueryExecutor,
+        saga_names: list[str],
+        group_ids: list[str] | None = None,
+    ) -> list[EpisodicNode]: ...
+
     @abstractmethod
     async def get_by_group_ids(
         self,
