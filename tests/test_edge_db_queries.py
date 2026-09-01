@@ -12,6 +12,14 @@ import pytest
 
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
+from graphiti_core.graph_queries import get_relationships_query
+
+
+def test_neo4j_relationship_fulltext_query_can_defer_candidate_limit():
+    unrestricted_query = get_relationships_query('edge_name_and_fact', None, GraphProvider.NEO4J)
+    limited_query      = get_relationships_query('edge_name_and_fact', 10, GraphProvider.NEO4J)
+    assert '{limit: $limit}' not in unrestricted_query
+    assert '{limit: $limit}' in limited_query
 
 
 def test_neo4j_uses_start_end_node():

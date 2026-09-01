@@ -163,7 +163,8 @@ def get_vector_cosine_func_query(vec1, vec2, provider: GraphProvider) -> str:
     return f'vector.similarity.cosine({vec1}, {vec2})'
 
 
-def get_relationships_query(name: str, limit: int, provider: GraphProvider) -> str:
+# signature changed by David Williamson 2026-09-01
+def get_relationships_query(name: str, limit: int | None, provider: GraphProvider) -> str:
     if provider == GraphProvider.FALKORDB:
         label = NEO4J_TO_FALKORDB_MAPPING[name]
         return f"CALL db.idx.fulltext.queryRelationships('{label}', $query)"
@@ -171,5 +172,10 @@ def get_relationships_query(name: str, limit: int, provider: GraphProvider) -> s
     if provider == GraphProvider.KUZU:
         label = INDEX_TO_LABEL_KUZU_MAPPING[name]
         return f"CALL QUERY_FTS_INDEX('{label}', '{name}', cast($query AS STRING), TOP := $limit)"
+
+    # added by David Williamson 2026-09-01
+    # provenance-filtered searches must apply their limit after the Cypher WHERE clause
+    if limit is None:
+        return f'CALL db.index.fulltext.queryRelationships("{name}", $query)'
 
     return f'CALL db.index.fulltext.queryRelationships("{name}", $query, {{limit: $limit}})'

@@ -27,6 +27,7 @@ from graphiti_core.embedder.client import EmbedderClient
 from graphiti_core.helpers import lucene_sanitize
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
+from graphiti_core.search.search_filters import SearchFilters, edge_search_filter_query_constructor
 
 load_dotenv()
 
@@ -194,6 +195,22 @@ def test_lucene_sanitize():
     for query, assert_result in queries:
         result = lucene_sanitize(query)
         assert assert_result == result
+
+
+# added by David Williamson 2026-09-01
+def test_edge_search_filter_query_constructor_filters_episode_provenance():
+
+    episode_uuids = ['episode-a', 'episode-b']
+    search_filter = SearchFilters(episode_uuids=episode_uuids)
+
+    filter_queries, filter_params = edge_search_filter_query_constructor(
+        search_filter, GraphProvider.NEO4J
+    )
+
+    assert filter_queries == [
+        'any(episode_uuid IN coalesce(e.episodes, []) WHERE episode_uuid IN $episode_uuids)'
+    ]
+    assert filter_params['episode_uuids'] == episode_uuids
 
 
 async def get_node_count(driver: GraphDriver, uuids: list[str]) -> int:

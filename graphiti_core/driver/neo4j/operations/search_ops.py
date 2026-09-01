@@ -253,8 +253,13 @@ class Neo4jSearchOperations(SearchOperations):
         if filter_queries:
             filter_query = ' WHERE ' + (' AND '.join(filter_queries))
 
+        # added by David Williamson 2026-09-01
+        # when filtering by provenance, do not discard candidates before that filter has run
+        fulltext_limit = None if search_filter.episode_uuids is not None else limit
+
+        # modified by David Williamson 2026-09-01
         cypher = (
-            get_relationships_query('edge_name_and_fact', limit=limit, provider=GraphProvider.NEO4J)
+            get_relationships_query('edge_name_and_fact', limit=fulltext_limit, provider=GraphProvider.NEO4J)
             + """
             YIELD relationship AS rel, score
             MATCH (n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]->(m:Entity)
