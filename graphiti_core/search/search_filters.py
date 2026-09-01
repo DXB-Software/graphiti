@@ -64,8 +64,9 @@ class SearchFilters(BaseModel):
     created_at: list[list[DateFilter]] | None = Field(default=None)
     expired_at: list[list[DateFilter]] | None = Field(default=None)
     edge_uuids: list[str] | None = Field(default=None)
-    # next line added by David Williamson 2026-09-01
-    episode_uuids: list[str] | None = Field(default=None)
+    # next two lines added by David Williamson 2026-09-01
+    episode_uuids          : list[str] | None = Field(default=None)
+    episode_created_at_lte : datetime | None = Field(default=None)
     property_filters: list[PropertyFilter] | None = Field(default=None)
 
     @field_validator('node_labels')
@@ -142,10 +143,32 @@ def edge_search_filter_query_constructor(
         if provider != GraphProvider.NEO4J:
             raise ValueError('episode_uuids search filtering is currently supported only for Neo4j')
 
-        filter_queries.append(
-            'any(episode_uuid IN coalesce(e.episodes, []) WHERE episode_uuid IN $episode_uuids)'
-        )
         filter_params['episode_uuids'] = filters.episode_uuids
+
+        # when a knowledge-time cutoff is supplied, the same authorised supporting episode must
+        # have existed by that time; the canonical edge's own created_at is not sufficient because
+        # one deduplicated fact can accumulate provenance from episodes ingested at different times
+        if filters.episode_created_at_lte is not None:
+
+            filter_queries.append(
+                'EXISTS { '
+                'MATCH (episode:Episodic) '
+                'WHERE episode.uuid IN coalesce(e.episodes, []) '
+                'AND episode.uuid IN $episode_uuids '
+                'AND episode.created_at <= $episode_created_at_lte '
+                '}'
+            )
+            filter_params['episode_created_at_lte'] = filters.episode_created_at_lte
+
+        else:
+
+            filter_queries.append(
+                'any(episode_uuid IN coalesce(e.episodes, []) WHERE episode_uuid IN $episode_uuids)'
+            )
+
+    elif filters.episode_created_at_lte is not None:
+
+        raise ValueError('episode_created_at_lte requires episode_uuids')
 
     if filters.node_labels is not None:
         # Defense-in-depth for model_construct()/other validation bypasses.

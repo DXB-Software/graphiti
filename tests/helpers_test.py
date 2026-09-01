@@ -15,10 +15,11 @@ limitations under the License.
 """
 
 import os
-from unittest.mock import Mock
-
 import numpy as np
 import pytest
+
+from datetime import datetime, timezone
+from unittest.mock import Mock
 from dotenv import load_dotenv
 
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
@@ -201,7 +202,11 @@ def test_lucene_sanitize():
 def test_edge_search_filter_query_constructor_filters_episode_provenance():
 
     episode_uuids = ['episode-a', 'episode-b']
-    search_filter = SearchFilters(episode_uuids=episode_uuids)
+
+    # without a knowledge-time cutoff, preserve the existing provenance-only filter
+    search_filter = SearchFilters(
+        episode_uuids=episode_uuids,
+    )
 
     filter_queries, filter_params = edge_search_filter_query_constructor(
         search_filter, GraphProvider.NEO4J
@@ -211,6 +216,31 @@ def test_edge_search_filter_query_constructor_filters_episode_provenance():
         'any(episode_uuid IN coalesce(e.episodes, []) WHERE episode_uuid IN $episode_uuids)'
     ]
     assert filter_params['episode_uuids'] == episode_uuids
+
+    # with a knowledge-time cutoff, authorisation and time must apply to the same support episode
+    known_at = datetime(2025, 1, 15, 12, 0, tzinfo=timezone.utc)
+
+    search_filter = SearchFilters(
+        episode_uuids          = episode_uuids,
+        episode_created_at_lte = known_at,
+    )
+
+    filter_queries, filter_params = edge_search_filter_query_constructor(
+        search_filter, GraphProvider.NEO4J
+    )
+
+    assert filter_queries == [
+        (
+            'EXISTS { '
+            'MATCH (episode:Episodic) '
+            'WHERE episode.uuid IN coalesce(e.episodes, []) '
+            'AND episode.uuid IN $episode_uuids '
+            'AND episode.created_at <= $episode_created_at_lte '
+            '}'
+        )
+    ]
+    assert filter_params['episode_uuids'] == episode_uuids
+    assert filter_params['episode_created_at_lte'] == known_at
 
 
 async def get_node_count(driver: GraphDriver, uuids: list[str]) -> int:
