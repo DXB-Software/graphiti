@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+
 from datetime import datetime
 from time import time
 
@@ -48,6 +49,7 @@ from graphiti_core.utils.text_utils import concatenate_episodes
 
 logger = logging.getLogger(__name__)
 
+EDGE_TIMESTAMP_BATCH_SIZE = 8
 
 def build_episodic_edges(
     entity_nodes: list[EntityNode],
@@ -362,7 +364,7 @@ async def resolve_extracted_edges(
     llm_client = clients.llm_client
     embedder   = clients.embedder
 
-    # resolve missing temporal bounds in one LLM call rather than one call per edge
+    # resolve missing temporal bounds in bounded LLM batches
     await _extract_edge_timestamps_batch(
         llm_client,
         extracted_edges,
@@ -650,35 +652,42 @@ async def _extract_edge_timestamps_batch(
     if not missing_edges:
         return
 
-    context = {
-        'facts': [
-            {
-                'fact': edge.fact,
-                'reference_time': episode.valid_at.isoformat(),
-            }
-            for edge in missing_edges
-        ],
-    }
+    timestamps: list[EdgeTimestamps] = []
 
     try:
+        
+        for batch_start in range(0, len(missing_edges), _EDGE_TIMESTAMP_BATCH_SIZE):
+            batch_edges = missing_edges[
+                batch_start : batch_start + _EDGE_TIMESTAMP_BATCH_SIZE
+            ]
 
-        llm_response = await llm_client.generate_response(
-            prompt_library.extract_edges.extract_timestamps_batch(context),
-            response_model=BatchEdgeTimestamps,
-            model_size=ModelSize.small,
-            prompt_name='extract_edges.extract_timestamps_batch',
-        )
+            context = {
+                'facts': [
+                    {
+                        'fact': edge.fact,
+                        'reference_time': episode.valid_at.isoformat(),
+                    }
+                    for edge in batch_edges
+                ],
+            }
 
-        timestamps = BatchEdgeTimestamps(**llm_response).timestamps
-
-        if len(timestamps) != len(missing_edges):
-
-            logger.warning(
-                f'Batch timestamp extraction returned {len(timestamps)} results '
-                f'for {len(missing_edges)} edges; leaving temporal bounds unset'
+            llm_response = await llm_client.generate_response(
+                prompt_library.extract_edges.extract_timestamps_batch(context),
+                response_model=BatchEdgeTimestamps,
+                model_size=ModelSize.small,
+                prompt_name='extract_edges.extract_timestamps_batch',
             )
 
-            return
+            batch_timestamps = BatchEdgeTimestamps(**llm_response).timestamps
+
+            if len(batch_timestamps) != len(batch_edges):
+                logger.warning(
+                    f'Batch timestamp extraction returned {len(batch_timestamps)} results '
+                    f'for {len(batch_edges)} edges; leaving temporal bounds unset'
+                )
+                return
+
+            timestamps.extend(batch_timestamps)
 
         for edge, temporal_bounds in zip(missing_edges, timestamps, strict=True):
 
