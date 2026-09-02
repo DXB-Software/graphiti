@@ -25,7 +25,7 @@ class ModelSize(Enum):
     medium = 'medium'
 
 
-DEFAULT_MODEL_SIZE = ModelSize.small
+DEFAULT_MODEL_SIZE = ModelSize.medium
 
 
 class LLMConfig:
