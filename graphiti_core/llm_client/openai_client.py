@@ -62,6 +62,14 @@ class OpenAIClient(BaseOpenAIClient):
         else:
             self.client = client
 
+    def _client_for_model(self, model: str) -> typing.Any:
+        """Return the transport that serves the requested model.
+
+        The base implementation always uses the configured client. Subclasses
+        override this to serve different model sizes from different endpoints.
+        """
+        return self.client
+
     async def _create_structured_completion(
         self,
         model: str,
@@ -100,7 +108,7 @@ class OpenAIClient(BaseOpenAIClient):
         if is_reasoning_model and verbosity is not None:
             request_kwargs['text'] = {'verbosity': verbosity}  # type: ignore
 
-        response = await self.client.responses.parse(**request_kwargs)
+        response = await self._client_for_model(model).responses.parse(**request_kwargs)
 
         return response
 
@@ -130,4 +138,4 @@ class OpenAIClient(BaseOpenAIClient):
         if not is_reasoning_model and temperature is not None:
             request_kwargs['temperature'] = temperature
 
-        return await self.client.chat.completions.create(**request_kwargs)
+        return await self._client_for_model(model).chat.completions.create(**request_kwargs)
