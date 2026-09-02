@@ -26,7 +26,7 @@ from pydantic import BaseModel
 
 from ..prompts.models import Message
 from .client import LLMClient, get_extraction_language_instruction
-from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
+from .config import DEFAULT_MAX_TOKENS, DEFAULT_MODEL_SIZE, LLMConfig, ModelSize
 from .errors import RateLimitError, RefusalError
 
 logger = logging.getLogger(__name__)
@@ -187,7 +187,7 @@ class BaseOpenAIClient(LLMClient):
         messages: list[Message],
         response_model: type[BaseModel] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
-        model_size: ModelSize = ModelSize.medium,
+        model_size: ModelSize = DEFAULT_MODEL_SIZE,
     ) -> tuple[dict[str, Any], int, int]:
         """Generate a response using the appropriate client implementation.
 
@@ -243,7 +243,7 @@ class BaseOpenAIClient(LLMClient):
         messages: list[Message],
         response_model: type[BaseModel] | None = None,
         max_tokens: int | None = None,
-        model_size: ModelSize = ModelSize.medium,
+        model_size: ModelSize = DEFAULT_MODEL_SIZE,
         group_id: str | None = None,
         prompt_name: str | None = None,
         *,

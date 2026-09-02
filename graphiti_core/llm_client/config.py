@@ -25,6 +25,9 @@ class ModelSize(Enum):
     medium = 'medium'
 
 
+DEFAULT_MODEL_SIZE = ModelSize.small
+
+
 class LLMConfig:
     """
     Configuration class for the Language Learning Model (LLM).

@@ -27,7 +27,7 @@ from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random_
 from ..prompts.models import Message
 from ..tracer import NoOpTracer, Tracer
 from .cache import LLMCache
-from .config import DEFAULT_MAX_TOKENS, LLMConfig, ModelSize
+from .config import DEFAULT_MAX_TOKENS, DEFAULT_MODEL_SIZE, LLMConfig, ModelSize
 from .errors import EmptyResponseError, RateLimitError
 from .token_tracker import TokenUsageTracker
 
@@ -133,7 +133,7 @@ class LLMClient(ABC):
         messages: list[Message],
         response_model: type[BaseModel] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
-        model_size: ModelSize = ModelSize.medium,
+        model_size: ModelSize = DEFAULT_MODEL_SIZE,
     ) -> dict[str, typing.Any]:
         try:
             return await self._generate_response(messages, response_model, max_tokens, model_size)
@@ -146,7 +146,7 @@ class LLMClient(ABC):
         messages: list[Message],
         response_model: type[BaseModel] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
-        model_size: ModelSize = ModelSize.medium,
+        model_size: ModelSize = DEFAULT_MODEL_SIZE,
     ) -> dict[str, typing.Any]:
         pass
 
@@ -199,7 +199,7 @@ class LLMClient(ABC):
         messages: list[Message],
         response_model: type[BaseModel] | None = None,
         max_tokens: int | None = None,
-        model_size: ModelSize = ModelSize.medium,
+        model_size: ModelSize = DEFAULT_MODEL_SIZE,
         group_id: str | None = None,
         prompt_name: str | None = None,
         *,
