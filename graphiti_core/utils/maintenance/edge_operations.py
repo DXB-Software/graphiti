@@ -656,9 +656,9 @@ async def _extract_edge_timestamps_batch(
 
     try:
         
-        for batch_start in range(0, len(missing_edges), _EDGE_TIMESTAMP_BATCH_SIZE):
+        for batch_start in range(0, len(missing_edges), EDGE_TIMESTAMP_BATCH_SIZE):
             batch_edges = missing_edges[
-                batch_start : batch_start + _EDGE_TIMESTAMP_BATCH_SIZE
+                batch_start : batch_start + EDGE_TIMESTAMP_BATCH_SIZE
             ]
 
             context = {
