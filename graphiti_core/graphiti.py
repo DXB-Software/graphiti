@@ -134,13 +134,20 @@ class AddTripletResults(BaseModel):
     edges: list[EntityEdge]
 
 
-# added by David Williamson 2026-08-31
+# added by David Williamson 2026-08-31 and updated 2026-09-04
 class SagaSnapshotResults(BaseModel):
     exists: bool
     episode_ids: list[str]
     sequence_edge_count: int
     entity_count: int
     relationship_count: int
+    # sequence topology: an unbranched chain over N episodes has N-1 edges, no episode with more
+    # than one successor or predecessor, and exactly one start and one end. the edge count alone
+    # cannot tell a chain apart from a branch or from two disconnected runs.
+    branch_count: int = 0
+    merge_count: int = 0
+    head_count: int = 0
+    tail_count: int = 0
 
 
 # added by David Williamson 2026-08-31
@@ -484,12 +491,47 @@ class Graphiti:
             if value
         ]
 
+        # sequence topology is a second query on purpose: folding per-episode degrees into the
+        # aggregate above makes it unreadable, and this runs on the admin audit path, not on ingest
+        topology_records, _, _ = await self.driver.execute_query(
+            """
+            MATCH (s:Saga {name: $saga_name})-[:HAS_EPISODE]->(episode:Episodic)
+            WITH collect(DISTINCT episode.uuid) AS episode_ids
+
+            UNWIND episode_ids AS episode_id
+            MATCH (episode:Episodic {uuid: episode_id})
+
+            OPTIONAL MATCH (episode)-[out_edge:NEXT_EPISODE]->(next_episode:Episodic)
+            WHERE next_episode.uuid IN episode_ids
+
+            OPTIONAL MATCH (previous_episode:Episodic)-[in_edge:NEXT_EPISODE]->(episode)
+            WHERE previous_episode.uuid IN episode_ids
+
+            WITH episode_id,
+                 count(DISTINCT out_edge) AS out_degree,
+                 count(DISTINCT in_edge) AS in_degree
+
+            RETURN count(CASE WHEN out_degree > 1 THEN 1 END) AS branch_count,
+                   count(CASE WHEN in_degree > 1 THEN 1 END) AS merge_count,
+                   count(CASE WHEN in_degree = 0 THEN 1 END) AS head_count,
+                   count(CASE WHEN out_degree = 0 THEN 1 END) AS tail_count
+            """,
+            saga_name=saga_name,
+            routing_='r',
+        )
+
+        topology = topology_records[0] if topology_records else {}
+
         return SagaSnapshotResults(
             exists=True,
             episode_ids=episode_ids,
             sequence_edge_count=int(record.get('sequence_edge_count') or 0),
             entity_count=len(entity_ids),
             relationship_count=len(edge_ids),
+            branch_count=int(topology.get('branch_count') or 0),
+            merge_count=int(topology.get('merge_count') or 0),
+            head_count=int(topology.get('head_count') or 0),
+            tail_count=int(topology.get('tail_count') or 0),
         )
 
     # added by David Williamson 2026-08-31
