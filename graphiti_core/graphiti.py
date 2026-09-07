@@ -26,7 +26,7 @@ from typing_extensions import LiteralString
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.decorators import handle_multiple_group_ids
-from graphiti_core.driver.driver import GraphDriver
+from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
 from graphiti_core.edges import (
     CommunityEdge,
@@ -1444,16 +1444,11 @@ class Graphiti:
                 'pre_extracted_nodes and pre_extracted_edges must be supplied together'
             )
 
+        # group_id is stored as a property on the episode, its entities, its edges and its Saga
         if group_id is None:
-            # if group_id is None, use the default group id by the provider
-            # and the preset database name will be used
             group_id = get_default_group_id(self.driver.provider)
         else:
             validate_group_id(group_id)
-            if group_id != self.driver._database:
-                # if group_id is provided, use it as the database name
-                self.driver = self.driver.clone(database=group_id)
-                self.clients.driver = self.driver
 
         with self.tracer.start_span('add_episode') as span:
             try:
@@ -1791,15 +1786,11 @@ class Graphiti:
                 start = time()
                 now = utc_now()
 
-                # if group_id is None, use the default group id by the provider
+                # group_id is stored as a property on the episode, its entities and its edges
                 if group_id is None:
                     group_id = get_default_group_id(self.driver.provider)
                 else:
                     validate_group_id(group_id)
-                    if group_id != self.driver._database:
-                        # if group_id is provided, use it as the database name
-                        self.driver = self.driver.clone(database=group_id)
-                        self.clients.driver = self.driver
 
                 # Create default edge type map
                 edge_type_map_default = (
