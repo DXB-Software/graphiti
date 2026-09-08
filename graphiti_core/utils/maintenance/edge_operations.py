@@ -345,13 +345,14 @@ async def resolve_extracted_edges(
         - new_edges: Only edges that are new to the graph (not duplicates of existing edges)
     """
     # Fast path: deduplicate exact matches within the extracted edges before parallel processing
-    seen: dict[tuple[str, str, str], EntityEdge] = {}
+    seen: dict[tuple[str, str, str, str], EntityEdge] = {}
     deduplicated_edges: list[EntityEdge] = []
 
     for edge in extracted_edges:
         key = (
             edge.source_node_uuid,
             edge.target_node_uuid,
+            edge.name,
             _normalize_string_exact(edge.fact),
         )
         if key not in seen:
@@ -796,12 +797,13 @@ async def resolve_extracted_edge(
 
         return extracted_edge, [], []
 
-    # Fast path: if the fact text and endpoints already exist verbatim, reuse the matching edge.
+    # Fast path: if the relation type, fact text and endpoints already exist verbatim, reuse the matching edge.
     normalized_fact = _normalize_string_exact(extracted_edge.fact)
     for edge in related_edges:
         if (
             edge.source_node_uuid == extracted_edge.source_node_uuid
             and edge.target_node_uuid == extracted_edge.target_node_uuid
+            and edge.name == extracted_edge.name
             and _normalize_string_exact(edge.fact) == normalized_fact
         ):
             resolved = edge
