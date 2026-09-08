@@ -35,6 +35,18 @@ _FUZZY_JACCARD_THRESHOLD = 0.9
 _MINHASH_PERMUTATIONS = 32
 _MINHASH_BAND_SIZE = 4
 
+# entity labels whose name describes a single occurrence rather than a lasting identity
+_OCCURRENCE_LABELS = frozenset(
+    {
+        'BoardSeat',
+        'Commitment',
+        'Deal',
+        'Event',
+        'FinancialMetric',
+        'RegulatoryFiling',
+    }
+)
+
 
 def _normalize_string_exact(name: str) -> str:
     """Lowercase text and collapse whitespace so equal names map to the same key."""
@@ -224,11 +236,18 @@ def _resolve_with_similarity(
 ) -> None:
     """Attempt deterministic resolution using exact name hits and fuzzy MinHash comparisons.
 
-    Exact normalized-name matching runs first for *all* names regardless of
-    length or entropy.  The entropy gate only guards the fuzzy (MinHash/LSH)
-    path where short or low-entropy names produce unreliable shingle sets.
+    Nodes carrying an occurrence label are left for the model.  For the rest, exact
+    normalized-name matching runs first regardless of length or entropy; the entropy gate
+    only guards the fuzzy (MinHash/LSH) path where short or low-entropy names produce
+    unreliable shingle sets.
     """
     for idx, node in enumerate(extracted_nodes):
+        # the model resolves occurrence entities against the episode text, which carries the
+        # company and date that separate one instance from another
+        if _OCCURRENCE_LABELS.intersection(node.labels):
+            state.unresolved_indices.append(idx)
+            continue
+
         normalized_exact = _normalize_string_exact(node.name)
         normalized_fuzzy = _normalize_name_for_fuzzy(node.name)
 
@@ -290,6 +309,7 @@ __all__ = [
     '_jaccard_similarity',
     '_cached_shingles',
     '_FUZZY_JACCARD_THRESHOLD',
+    '_OCCURRENCE_LABELS',
     '_build_candidate_indexes',
     '_promote_resolved_node',
     '_resolve_with_similarity',
