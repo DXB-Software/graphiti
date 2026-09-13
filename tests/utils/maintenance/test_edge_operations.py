@@ -9,6 +9,8 @@ from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EntityNode, EpisodicNode
 from graphiti_core.search.search_config import SearchResults
 from graphiti_core.utils.maintenance.edge_operations import (
+    _clear_impossible_temporal_interval,
+    _extract_edge_timestamps_batch,
     extract_edges,
     resolve_extracted_edge,
     resolve_extracted_edges,
@@ -97,6 +99,102 @@ def mock_previous_episodes():
             source_description='Test source description',
         )
     ]
+
+
+# test to verify an impossible temporal interval is discarded rather than persisted
+def test_clear_impossible_temporal_interval_discards_reversed_bounds() -> None:
+
+    edge = EntityEdge(
+        source_node_uuid = 'source_uuid',
+        target_node_uuid = 'target_uuid',
+        name             = 'ASSOCIATED_WITH',
+        group_id         = 'group_1',
+        fact             = 'Example relationship',
+        episodes         = ['episode_1'],
+        created_at       = datetime.now(timezone.utc),
+        valid_at         = datetime(2022, 9, 18, tzinfo=timezone.utc),
+        invalid_at       = datetime(2022, 9, 16, tzinfo=timezone.utc),
+    ) # edge
+
+    # enforce the deterministic temporal invariant
+    _clear_impossible_temporal_interval(edge)
+
+    assert edge.valid_at is None
+    assert edge.invalid_at is None
+
+
+# test to verify a valid temporal interval survives invariant enforcement unchanged
+def test_clear_impossible_temporal_interval_preserves_valid_bounds() -> None:
+
+    valid_at   = datetime(2022, 9, 16, tzinfo=timezone.utc)
+    invalid_at = datetime(2022, 9, 18, tzinfo=timezone.utc)
+
+    edge = EntityEdge(
+        source_node_uuid = 'source_uuid',
+        target_node_uuid = 'target_uuid',
+        name             = 'ASSOCIATED_WITH',
+        group_id         = 'group_1',
+        fact             = 'Example relationship',
+        episodes         = ['episode_1'],
+        created_at       = datetime.now(timezone.utc),
+        valid_at         = valid_at,
+        invalid_at       = invalid_at,
+    ) # edge
+
+    # enforce the deterministic temporal invariant
+    _clear_impossible_temporal_interval(edge)
+
+    assert edge.valid_at == valid_at
+    assert edge.invalid_at == invalid_at
+
+
+# test to verify bad small-model timestamp output cannot escape the batch extraction path
+@pytest.mark.asyncio
+async def test_extract_edge_timestamps_batch_discards_reversed_bounds() -> None:
+
+    llm_client                   = MagicMock()
+    llm_client.generate_response = AsyncMock(
+        return_value={
+            'timestamps': [
+                {
+                    'valid_at'   : '2022-09-18T00:00:00Z',
+                    'invalid_at' : '2022-09-16T00:00:00Z',
+                }
+            ]
+        }
+    ) # llm_client.generate_response
+
+    edge = EntityEdge(
+        source_node_uuid = 'source_uuid',
+        target_node_uuid = 'target_uuid',
+        name             = 'ASSOCIATED_WITH',
+        group_id         = 'group_1',
+        fact             = 'Example relationship',
+        episodes         = ['episode_1'],
+        created_at       = datetime.now(timezone.utc),
+        valid_at         = None,
+        invalid_at       = None,
+    ) # edge
+
+    episode = EpisodicNode(
+        uuid               = 'episode_1',
+        content            = 'Current episode content',
+        valid_at           = datetime(2022, 9, 20, tzinfo=timezone.utc),
+        name               = 'Current Episode',
+        group_id           = 'group_1',
+        source             = 'message',
+        source_description = 'Test source description',
+    ) # episode
+
+    # exercise the real batch timestamp path used by pre-extracted InvestorDesk relationships
+    await _extract_edge_timestamps_batch(
+        llm_client,
+        [edge],
+        episode,
+    )
+
+    assert edge.valid_at is None
+    assert edge.invalid_at is None
 
 
 # Run the tests

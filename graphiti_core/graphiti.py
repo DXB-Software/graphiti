@@ -1060,8 +1060,17 @@ class Graphiti:
         episode_uuids = [ep.uuid for ep in episodes]
 
         episodic_edges = build_episodic_edges(nodes, episode_uuids, now, node_episode_index_map)
+
         for ep in episodes:
-            ep.entity_edges = [edge.uuid for edge in entity_edges]
+
+            # associate only relationships which actually carry provenance from this episode
+            ep.entity_edges = []
+
+            for edge in entity_edges:
+
+                if ep.uuid in edge.episodes:
+                    ep.entity_edges.append(edge.uuid)
+
             if not self.store_raw_episode_content:
                 ep.content = ''
 

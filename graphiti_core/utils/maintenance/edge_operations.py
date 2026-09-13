@@ -51,6 +51,24 @@ logger = logging.getLogger(__name__)
 
 EDGE_TIMESTAMP_BATCH_SIZE = 8
 
+# clear impossible model-derived temporal bounds before they can become durable graph state
+def _clear_impossible_temporal_interval(edge: EntityEdge) -> None:
+    """Clear temporal bounds when an edge ends before it begins."""
+
+    valid_at   = ensure_utc(edge.valid_at)
+    invalid_at = ensure_utc(edge.invalid_at)
+
+    if valid_at is None or invalid_at is None or invalid_at >= valid_at:
+        return
+
+    logger.warning(
+        f"[CLEAR_IMPOSSIBLE_TEMPORAL_INTERVAL] Clearing impossible interval for edge "
+        f"{edge.uuid}: valid_at={valid_at.isoformat()} invalid_at={invalid_at.isoformat()}"
+    )
+
+    edge.valid_at   = None
+    edge.invalid_at = None
+
 def build_episodic_edges(
     entity_nodes: list[EntityNode],
     episode_uuid: str | list[str],
@@ -314,6 +332,7 @@ async def extract_edges(
                 else primary_episode.valid_at
             ),
         )
+        _clear_impossible_temporal_interval(edge)
         edges.append(edge)
         logger.debug(
             f'Created new edge {edge.uuid} from {edge.source_node_uuid} to {edge.target_node_uuid}'
@@ -538,6 +557,10 @@ async def resolve_extracted_edges(
         if resolved_edge.uuid == extracted_edge.uuid:
             new_edges.append(resolved_edge)
 
+    # enforce the temporal invariant again after deduplication and contradiction resolution
+    for edge in [*resolved_edges, *invalidated_edges]:
+        _clear_impossible_temporal_interval(edge)
+        
     logger.debug(f'Resolved edges: {[e.uuid for e in resolved_edges]}')
     logger.debug(f'New edges (non-duplicates): {[e.uuid for e in new_edges]}')
 
@@ -723,6 +746,9 @@ async def _extract_edge_timestamps_batch(
                     logger.debug(
                         f'Error parsing invalid_at: {temporal_bounds.invalid_at}'
                     )
+
+            # never allow probabilistic timestamp extraction to create an impossible graph interval
+            _clear_impossible_temporal_interval(edge)
 
     except Exception:
 

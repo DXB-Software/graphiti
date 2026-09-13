@@ -170,6 +170,9 @@ You may use information from the PREVIOUS MESSAGES only to disambiguate referenc
 - Use ISO 8601 with "Z" suffix (UTC) (e.g., 2025-04-30T00:00:00Z).
 - If the fact is ongoing (present tense), set `valid_at` to the timestamp of the episode the fact originates from. If no per-episode timestamp is available, use REFERENCE_TIME.
 - If a change/termination is expressed, set `invalid_at` to the relevant timestamp.
+- If both `valid_at` and `invalid_at` are present, `invalid_at` MUST be later than or equal to `valid_at`.
+- If the ordering is uncertain, leave the uncertain temporal bound `null`.
+- NEVER return an interval where `invalid_at` is earlier than `valid_at`.
 - Leave both fields `null` if no explicit or resolvable time is stated.
 - If only a date is mentioned (no time), assume 00:00:00.
 - If only a year is mentioned, use January 1st at 00:00:00.
@@ -254,6 +257,9 @@ Rules:
 - Resolve relative expressions ("last week", "2 years ago", "yesterday") using REFERENCE TIME.
 - If the fact is ongoing (present tense), set valid_at to REFERENCE TIME.
 - If a change or end is expressed, set invalid_at to the relevant time.
+- If both valid_at and invalid_at are present, invalid_at MUST be later than or equal to valid_at.
+- If the ordering is uncertain, leave the uncertain temporal bound null.
+- NEVER return an interval where invalid_at is earlier than valid_at.
 - Leave both null if no time is stated or resolvable.
 - If only a date is mentioned (no time), assume 00:00:00.
 - Use ISO 8601 with Z suffix (e.g., 2025-04-30T00:00:00Z).
@@ -286,6 +292,9 @@ Rules:
 - Resolve relative expressions ("last week", "2 years ago", "yesterday") using each fact's REFERENCE TIME.
 - If the fact is ongoing (present tense), set valid_at to its REFERENCE TIME.
 - If a change or end is expressed, set invalid_at to the relevant time.
+- If both valid_at and invalid_at are present, invalid_at MUST be later than or equal to valid_at.
+- If the ordering is uncertain, leave the uncertain temporal bound null.
+- NEVER return an interval where invalid_at is earlier than valid_at.
 - Leave both null if no time is stated or resolvable.
 - If only a date is mentioned (no time), assume 00:00:00.
 - Use ISO 8601 with Z suffix (e.g., 2025-04-30T00:00:00Z).
