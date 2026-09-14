@@ -157,6 +157,19 @@ async def add_nodes_and_edges_bulk_tx(
     embedder: EmbedderClient,
     driver: GraphDriver,
 ):
+    # bulk persistence performs a full property replacement for each relationship UUID, so two
+    # snapshots of one UUID would make the result dependent on write order and must never reach here
+    entity_edge_uuids = set()
+
+    for edge in entity_edges:
+
+        if edge.uuid in entity_edge_uuids:
+            raise RuntimeError(
+                f"Duplicate EntityEdge uuid reached bulk persistence: {edge.uuid}"
+            )
+
+        entity_edge_uuids.add(edge.uuid)
+
     episodes = [dict(episode) for episode in episodic_nodes]
     for episode in episodes:
         episode['source'] = str(episode['source'].value)

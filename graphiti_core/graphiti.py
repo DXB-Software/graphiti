@@ -82,7 +82,7 @@ from graphiti_core.utils.bulk_utils import (
     resolve_edge_pointers,
     retrieve_previous_episodes_bulk,
 )
-from graphiti_core.utils.datetime_utils import utc_now
+from graphiti_core.utils.datetime_utils import ensure_utc, utc_now
 from graphiti_core.utils.maintenance.community_operations import (
     build_communities,
     remove_communities,
@@ -109,6 +109,103 @@ from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+
+# coalesce repeated snapshots of one canonical relationship before persistence so a stale
+# invalidation snapshot cannot overwrite newer provenance from the same processing cycle
+def _coalesce_entity_edge_updates(
+    entity_edges : list[EntityEdge],
+) -> list[EntityEdge]:
+    """Return one edge update per UUID while preserving provenance and invalidation state."""
+
+    coalesced_edges = []
+    edges_by_uuid   = {}
+
+    for edge in entity_edges:
+
+        existing_edge = edges_by_uuid.get(edge.uuid)
+
+        if existing_edge is None:
+
+            # preserve the first canonical snapshot and normalise duplicate provenance ids
+            edge.episodes = list(dict.fromkeys(edge.episodes or []))
+
+            edges_by_uuid[edge.uuid] = edge
+            coalesced_edges.append(edge)
+
+            continue
+
+        identity_matches = (
+            existing_edge.source_node_uuid == edge.source_node_uuid
+            and existing_edge.target_node_uuid == edge.target_node_uuid
+            and existing_edge.name == edge.name
+            and existing_edge.fact == edge.fact
+            and existing_edge.group_id == edge.group_id
+        ) # identity_matches
+
+        # one UUID must never describe two different canonical relationships
+        if not identity_matches:
+            raise RuntimeError(
+                f"Conflicting EntityEdge snapshots share uuid={edge.uuid!r}"
+            )
+
+        # provenance is additive; a stale invalidation snapshot must never erase supporting episodes
+        for episode_uuid in edge.episodes or []:
+
+            if episode_uuid not in existing_edge.episodes:
+                existing_edge.episodes.append(episode_uuid)
+
+        # if any copy carries invalidation, retain the earliest known world-time invalidation
+        if edge.invalid_at is not None:
+
+            existing_invalid_at = ensure_utc(existing_edge.invalid_at)
+            candidate_invalid_at = ensure_utc(edge.invalid_at)
+
+            if (
+                existing_invalid_at is None
+                or (
+                    candidate_invalid_at is not None
+                    and candidate_invalid_at < existing_invalid_at
+                )
+            ):
+                existing_edge.invalid_at = edge.invalid_at
+
+        # expired_at is knowledge-time invalidation; retain the earliest persisted expiry
+        if edge.expired_at is not None:
+
+            existing_expired_at = ensure_utc(existing_edge.expired_at)
+            candidate_expired_at = ensure_utc(edge.expired_at)
+
+            if (
+                existing_expired_at is None
+                or (
+                    candidate_expired_at is not None
+                    and candidate_expired_at < existing_expired_at
+                )
+            ):
+                existing_edge.expired_at = edge.expired_at
+
+        # retain canonical temporal data when the preferred snapshot does not carry it
+        if existing_edge.valid_at is None and edge.valid_at is not None:
+            existing_edge.valid_at = edge.valid_at
+
+        if existing_edge.reference_time is None and edge.reference_time is not None:
+            existing_edge.reference_time = edge.reference_time
+
+        if existing_edge.fact_embedding is None and edge.fact_embedding is not None:
+            existing_edge.fact_embedding = edge.fact_embedding
+
+        # fill absent attributes without allowing a stale copy to replace the preferred values
+        existing_attributes = dict(existing_edge.attributes or {})
+
+        for attribute_name, attribute_value in dict(edge.attributes or {}).items():
+
+            if attribute_name not in existing_attributes:
+                existing_attributes[attribute_name] = attribute_value
+
+        existing_edge.attributes = existing_attributes
+
+    return coalesced_edges
 
 
 class AddEpisodeResults(BaseModel):
@@ -1601,7 +1698,11 @@ class Graphiti:
                         preserve_existing_attributes=True,
                     )
 
-                entity_edges = resolved_edges + invalidated_edges
+                # one canonical relationship can be both resolved and invalidated during this
+                # episode; merge those snapshots before deriving provenance or writing to the graph
+                entity_edges = _coalesce_entity_edge_updates(
+                    resolved_edges + invalidated_edges
+                ) # entity_edges
 
                 # merge attributes supplied by the external extractor onto canonical
                 # nodes after Graphiti has resolved aliases and duplicates
@@ -1889,13 +1990,28 @@ class Graphiti:
                 # Resolved pointers for episodic edges
                 resolved_episodic_edges = resolve_edge_pointers(episodic_edges, final_uuid_map)
 
+                # collapse repeated canonical relationship snapshots before either the episodes or
+                # the relationship rows are persisted
+                entity_edges = _coalesce_entity_edge_updates(
+                    resolved_edges + invalidated_edges
+                ) # entity_edges
+
+                # keep each episode's reverse relationship index consistent with edge.episodes
+                for episode in episodes:
+
+                    episode.entity_edges = [
+                        edge.uuid
+                        for edge in entity_edges
+                        if episode.uuid in edge.episodes
+                    ]
+
                 # save data to KG
                 await add_nodes_and_edges_bulk(
                     self.driver,
                     episodes,
                     resolved_episodic_edges,
                     final_hydrated_nodes,
-                    resolved_edges + invalidated_edges,
+                    entity_edges,
                     self.embedder,
                 )
 

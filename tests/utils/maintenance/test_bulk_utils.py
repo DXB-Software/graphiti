@@ -3,7 +3,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.edges import EntityEdge
+from graphiti_core.graphiti import _coalesce_entity_edge_updates
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.utils import bulk_utils
@@ -36,6 +38,109 @@ def _make_clients() -> GraphitiClients:
         cross_encoder=cross_encoder,
         llm_client=llm_client,
     )
+
+
+# verify one canonical edge can carry both new provenance and invalidation without either being lost
+def test_coalesce_entity_edge_updates_preserves_provenance_and_invalidation():
+
+    prior_episode   = "episode-prior"
+    current_episode = "episode-current"
+    invalid_at      = utc_now()
+    expired_at      = utc_now()
+
+    resolved_edge = EntityEdge(
+        uuid             = "canonical-edge",
+        source_node_uuid = "source",
+        target_node_uuid = "target",
+        name             = "REPORTED",
+        group_id         = "group",
+        fact             = "Example canonical fact.",
+        episodes         = [prior_episode, current_episode, current_episode],
+        created_at       = utc_now(),
+    ) # resolved_edge
+
+    invalidated_edge = resolved_edge.model_copy(deep=True)
+
+    # reproduce the corruption shape: the invalidation snapshot was loaded before the current
+    # episode was added to the separately-resolved copy of this same canonical relationship
+    invalidated_edge.episodes   = [prior_episode]
+    invalidated_edge.invalid_at = invalid_at
+    invalidated_edge.expired_at = expired_at
+
+    coalesced = _coalesce_entity_edge_updates(
+        [resolved_edge, invalidated_edge]
+    ) # coalesced
+
+    assert len(coalesced) == 1
+    assert coalesced[0].uuid == "canonical-edge"
+    assert coalesced[0].episodes == [prior_episode, current_episode]
+    assert coalesced[0].invalid_at == invalid_at
+    assert coalesced[0].expired_at == expired_at
+
+
+# verify a repeated UUID cannot silently merge two relationships with different canonical identities
+def test_coalesce_entity_edge_updates_rejects_conflicting_identity():
+
+    first_edge = EntityEdge(
+        uuid             = "conflicting-edge",
+        source_node_uuid = "source",
+        target_node_uuid = "target-one",
+        name             = "REPORTED",
+        group_id         = "group",
+        fact             = "First fact.",
+        episodes         = ["episode-one"],
+        created_at       = utc_now(),
+    ) # first_edge
+
+    second_edge = EntityEdge(
+        uuid             = "conflicting-edge",
+        source_node_uuid = "source",
+        target_node_uuid = "target-two",
+        name             = "REPORTED",
+        group_id         = "group",
+        fact             = "Second fact.",
+        episodes         = ["episode-two"],
+        created_at       = utc_now(),
+    ) # second_edge
+
+    with pytest.raises(RuntimeError, match="Conflicting EntityEdge snapshots"):
+        _coalesce_entity_edge_updates([first_edge, second_edge])
+
+
+# verify persistence itself refuses duplicate UUIDs if any caller bypasses the coalescing boundary
+@pytest.mark.asyncio
+async def test_bulk_persistence_rejects_duplicate_entity_edge_uuids():
+
+    first_edge = EntityEdge(
+        uuid             = "duplicate-persistence-edge",
+        source_node_uuid = "source",
+        target_node_uuid = "target",
+        name             = "REPORTED",
+        group_id         = "group",
+        fact             = "Example fact.",
+        episodes         = ["episode-one"],
+        created_at       = utc_now(),
+    ) # first_edge
+
+    second_edge = first_edge.model_copy(deep=True)
+
+    tx       = AsyncMock()
+    driver   = MagicMock()
+    embedder = MagicMock()
+
+    driver.provider                   = GraphProvider.NEO4J
+    driver.graph_operations_interface = None
+
+    with pytest.raises(RuntimeError, match="Duplicate EntityEdge uuid reached bulk persistence"):
+        await bulk_utils.add_nodes_and_edges_bulk_tx(
+            tx             = tx,
+            episodic_nodes = [],
+            episodic_edges = [],
+            entity_nodes   = [],
+            entity_edges   = [first_edge, second_edge],
+            embedder       = embedder,
+            driver         = driver,
+        )
 
 
 @pytest.mark.asyncio
