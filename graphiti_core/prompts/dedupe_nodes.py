@@ -42,12 +42,13 @@ class Prompt(Protocol):
     node: PromptVersion
     node_list: PromptVersion
     nodes: PromptVersion
-
+    nodes_repair: PromptVersion
 
 class Versions(TypedDict):
     node: PromptFunction
     node_list: PromptFunction
     nodes: PromptFunction
+    nodes_repair: PromptFunction
 
 
 def node(context: dict[str, Any]) -> list[Message]:
@@ -179,6 +180,66 @@ Result: duplicate_candidate_id = 0 (synonym — "car" and "vehicle" refer to the
     ]
 
 
+def nodes_repair(context: dict[str, Any]) -> list[Message]:
+    return [
+        Message(
+            role='system',
+            content=(
+                'You are repairing an invalid entity deduplication response. '
+                'Return only the complete corrected structured response.'
+            ),
+        ),
+        Message(
+            role='user',
+            content=f"""
+Your previous entity deduplication response violated the runtime constraints.
+
+<PREVIOUS MESSAGES>
+{to_prompt_json(context['previous_episodes'])}
+</PREVIOUS MESSAGES>
+
+<CURRENT MESSAGE>
+{context['episode_content']}
+</CURRENT MESSAGE>
+
+<ENTITIES>
+{to_prompt_json(context['extracted_nodes'])}
+</ENTITIES>
+
+<EXISTING ENTITIES>
+{to_prompt_json(context['existing_nodes'])}
+</EXISTING ENTITIES>
+
+<PREVIOUS RESPONSE>
+{to_prompt_json(context['previous_response'])}
+</PREVIOUS RESPONSE>
+
+<VALIDATION ERRORS>
+{to_prompt_json(context['validation_errors'])}
+</VALIDATION ERRORS>
+
+<EXPECTED ENTITY IDS>
+{to_prompt_json(context['expected_entity_ids'])}
+</EXPECTED ENTITY IDS>
+
+The legal duplicate_candidate_id values are:
+- -1 when no duplicate exists
+- candidate_id values in the range {context['candidate_range']}
+
+Rules:
+- Return exactly one resolution for every EXPECTED ENTITY ID.
+- Copy every entity id unchanged.
+- NEVER omit, duplicate, or invent an entity id.
+- NEVER return a duplicate_candidate_id outside the legal range.
+- Use duplicate_candidate_id = -1 when no existing entity is a genuine duplicate.
+- Re-evaluate the entities rather than merely changing an invalid number to a legal one.
+- Return the COMPLETE corrected response.
+- Do not explain the correction.
+""",
+        ),
+    ]
+
+
 def node_list(context: dict[str, Any]) -> list[Message]:
     return [
         Message(
@@ -222,4 +283,9 @@ Result:
     ]
 
 
-versions: Versions = {'node': node, 'node_list': node_list, 'nodes': nodes}
+versions: Versions = {
+    'node': node,
+    'node_list': node_list,
+    'nodes': nodes,
+    'nodes_repair': nodes_repair,
+}

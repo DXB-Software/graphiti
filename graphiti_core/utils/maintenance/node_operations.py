@@ -38,6 +38,7 @@ from graphiti_core.prompts.extract_nodes import (
     ExtractedEntities,
     ExtractedEntity,
     SummarizedEntities,
+    SummarizedEntity,
 )
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.search.search_utils import node_similarity_search
@@ -464,6 +465,61 @@ def _commit_resolution(
     state.duplicate_pairs.extend(duplicate_pairs)
 
 
+def _validate_node_resolution_response(
+    response_object : NodeResolutions,
+    entity_count    : int,
+    candidate_count : int,
+) -> list[str]:
+
+    validation_errors = []
+    expected_ids      = set(range(entity_count))
+    seen_ids          = set()
+
+    for resolution in response_object.entity_resolutions:
+
+        entity_id = resolution.id
+
+        if entity_id not in expected_ids:
+
+            validation_errors.append(
+                f"unexpected entity id={entity_id}; expected IDs=0-{entity_count - 1}"
+            )
+
+            continue
+
+        if entity_id in seen_ids:
+
+            validation_errors.append(
+                f"duplicate entity id={entity_id}"
+            )
+
+            continue
+
+        seen_ids.add(entity_id)
+
+        duplicate_candidate_id = resolution.duplicate_candidate_id
+
+        if (
+            duplicate_candidate_id != -1
+            and not 0 <= duplicate_candidate_id < candidate_count
+        ):
+
+            validation_errors.append(
+                f"entity id={entity_id} has invalid duplicate_candidate_id="
+                f"{duplicate_candidate_id}; EXISTING ENTITIES count={candidate_count}"
+            )
+
+    missing_ids = expected_ids - seen_ids
+
+    for entity_id in sorted(missing_ids):
+
+        validation_errors.append(
+            f"missing entity id={entity_id}"
+        )
+
+    return validation_errors
+
+
 async def _resolve_with_llm(
     llm_client: LLMClient,
     extracted_nodes: list[EntityNode],
@@ -556,7 +612,70 @@ async def _resolve_with_llm(
         prompt_name='dedupe_nodes.nodes',
     )
 
-    node_resolutions: list[NodeDuplicate] = NodeResolutions(**llm_response).entity_resolutions
+    response_object = NodeResolutions(**llm_response)
+
+    validation_errors = _validate_node_resolution_response(
+        response_object,
+        len(state.unresolved_indices),
+        len(indexes.existing_nodes),
+    ) # validation_errors
+
+    if validation_errors:
+
+        logger.info(
+            f"[_RESOLVE_WITH_LLM] Node-resolution response failed semantic validation; "
+            f"retrying once with explicit feedback: {validation_errors}"
+        )
+
+        candidate_range = (
+            f"0-{len(indexes.existing_nodes) - 1}"
+            if indexes.existing_nodes
+            else "none"
+        ) # candidate_range
+
+        repair_context = {
+            **context,
+            'previous_response'   : response_object.model_dump(),
+            'validation_errors'   : validation_errors,
+            'expected_entity_ids' : list(range(len(state.unresolved_indices))),
+            'candidate_range'     : candidate_range,
+        } # repair_context
+
+        repaired_response = await llm_client.generate_response(
+            prompt_library.dedupe_nodes.nodes_repair(
+                repair_context
+            ),
+            response_model=NodeResolutions,
+            model_size=ModelSize.small,
+            prompt_name='dedupe_nodes.nodes_repair',
+        ) # repaired_response
+
+        repaired_object = NodeResolutions(**repaired_response)
+
+        repair_validation_errors = _validate_node_resolution_response(
+            repaired_object,
+            len(state.unresolved_indices),
+            len(indexes.existing_nodes),
+        ) # repair_validation_errors
+
+        if repair_validation_errors:
+
+            logger.warning(
+                f"[_RESOLVE_WITH_LLM] Repaired node-resolution response remains invalid; "
+                f"falling back to deterministic filtering: {repair_validation_errors}"
+            )
+
+        else:
+
+            logger.info(
+                "[_RESOLVE_WITH_LLM] Repaired invalid node-resolution response"
+            )
+
+        # the repair supersedes the first semantic response; the existing deterministic
+        # guards below remain the final safety boundary
+        response_object = repaired_object
+
+    node_resolutions: list[NodeDuplicate] = response_object.entity_resolutions
 
     valid_relative_range = range(len(state.unresolved_indices))
     processed_relative_ids: set[int] = set()
@@ -605,7 +724,7 @@ async def _resolve_with_llm(
         extracted_node = extracted_nodes[original_index]
 
         resolved_node: EntityNode
-        if duplicate_candidate_id < 0:
+        if duplicate_candidate_id == -1:
             resolved_node = extracted_node
         elif duplicate_candidate_id in candidates_by_id:
             resolved_node = _promote_resolved_node(
@@ -930,6 +1049,51 @@ async def _extract_entity_summaries_batch(
     )
 
 
+def _validate_summary_response(
+    response_object : SummarizedEntities,
+    nodes           : list[EntityNode],
+) -> tuple[dict[int, SummarizedEntity], list[str]]:
+
+    expected_entity_ids = set(range(len(nodes)))
+    seen_entity_ids     = set()
+    summaries_by_id     = {}
+    validation_errors   = []
+
+    for summarized_entity in response_object.summaries:
+
+        entity_id = summarized_entity.entity_id
+
+        if entity_id not in expected_entity_ids:
+
+            validation_errors.append(
+                f"unexpected entity_id={entity_id}; expected entity count={len(nodes)}"
+            )
+
+            continue
+
+        if entity_id in seen_entity_ids:
+
+            validation_errors.append(
+                f"duplicate entity_id={entity_id}"
+            )
+
+            continue
+
+        seen_entity_ids.add(entity_id)
+
+        summaries_by_id[entity_id] = summarized_entity
+
+    missing_entity_ids = expected_entity_ids - seen_entity_ids
+
+    for entity_id in sorted(missing_entity_ids):
+
+        validation_errors.append(
+            f"missing entity_id={entity_id}"
+        )
+
+    return summaries_by_id, validation_errors
+
+
 async def _process_summary_flight(
     llm_client: LLMClient,
     nodes: list[EntityNode],
@@ -1008,33 +1172,72 @@ async def _process_summary_flight(
         for entity_id, node in enumerate(nodes)
     }
 
-    summaries_response   = SummarizedEntities(**llm_response)
-    processed_entity_ids = set()
+    response_object = SummarizedEntities(**llm_response)
 
-    for summarized_entity in summaries_response.summaries:
+    summaries_by_entity_id, validation_errors = _validate_summary_response(
+        response_object,
+        nodes,
+    ) # summaries_by_entity_id, validation_errors
 
-        entity_id = summarized_entity.entity_id
+    if validation_errors:
 
-        if entity_id in processed_entity_ids:
+        logger.info(
+            f"[_PROCESS_SUMMARY_FLIGHT] Summary response failed semantic validation; "
+            f"retrying once with explicit feedback: {validation_errors}"
+        )
+
+        repair_context = {
+            **batch_context,
+            'use_episode_prompt'  : use_episode_prompt,
+            'previous_response'   : response_object.model_dump(),
+            'validation_errors'   : validation_errors,
+            'expected_entity_ids' : list(nodes_by_entity_id),
+        } # repair_context
+
+        repaired_response = await llm_client.generate_response(
+            prompt_library.extract_nodes.extract_summaries_batch_repair(
+                repair_context
+            ),
+            response_model=SummarizedEntities,
+            model_size=ModelSize.small,
+            group_id=group_id,
+            prompt_name='extract_nodes.extract_summaries_batch_repair',
+        ) # repaired_response
+
+        repaired_object = SummarizedEntities(**repaired_response)
+
+        repaired_by_entity_id, repair_validation_errors = _validate_summary_response(
+            repaired_object,
+            nodes,
+        ) # repaired_by_entity_id, repair_validation_errors
+
+        if repair_validation_errors:
 
             logger.warning(
-                f"LLM returned duplicate summary for entity_id={entity_id}; ignoring duplicate"
+                f"[_PROCESS_SUMMARY_FLIGHT] Repaired summary response remains incomplete; "
+                f"retaining valid summaries and preserving existing state for unresolved entities: "
+                f"{repair_validation_errors}"
             )
 
-            continue
+        else:
 
-        node = nodes_by_entity_id.get(entity_id)
-
-        if node is None:
-
-            logger.warning(
-                f"LLM returned summary for invalid entity_id={entity_id}; "
-                f"valid entity count={len(nodes)}"
+            logger.info(
+                "[_PROCESS_SUMMARY_FLIGHT] Repaired incomplete summary response"
             )
 
-            continue
+        # valid repaired summaries supersede the first response while valid first-attempt
+        # summaries survive if the repair still fails to return one of them
+        summaries_by_entity_id.update(
+            repaired_by_entity_id
+        )
 
-        processed_entity_ids.add(entity_id)
+    # only validated summaries may update entity state; unresolved entities retain their prior summary
+    for entity_id, node in nodes_by_entity_id.items():
+
+        summarized_entity = summaries_by_entity_id.get(entity_id)
+
+        if summarized_entity is None:
+            continue
 
         node.summary = truncate_at_sentence(
             summarized_entity.summary,

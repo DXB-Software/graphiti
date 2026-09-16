@@ -74,6 +74,7 @@ def _clear_impossible_temporal_interval(edge: EntityEdge) -> None:
     edge.valid_at   = None
     edge.invalid_at = None
 
+
 def build_episodic_edges(
     entity_nodes: list[EntityNode],
     episode_uuid: str | list[str],
@@ -659,29 +660,48 @@ def _validate_edge_timestamp_response(
 
     validation_errors = []
 
-    if not timestamps.valid_at or not timestamps.invalid_at:
-        return validation_errors
+    valid_at   = None
+    invalid_at = None
 
-    try:
+    # validate each supplied bound independently so a malformed single bound also triggers repair
+    if timestamps.valid_at:
 
-        valid_at = ensure_utc(
-            datetime.fromisoformat(
-                timestamps.valid_at.replace("Z", "+00:00")
+        try:
+
+            valid_at = ensure_utc(
+                datetime.fromisoformat(
+                    timestamps.valid_at.replace("Z", "+00:00")
+                )
             )
-        )
 
-        invalid_at = ensure_utc(
-            datetime.fromisoformat(
-                timestamps.invalid_at.replace("Z", "+00:00")
+        except ValueError:
+
+            validation_errors.append(
+                f"valid_at is not parseable ISO 8601; value={timestamps.valid_at!r}"
             )
-        )
 
-    except ValueError:
+    if timestamps.invalid_at:
 
-        # parsing remains handled by the timestamp application path below
-        return validation_errors
+        try:
 
-    if invalid_at < valid_at:
+            invalid_at = ensure_utc(
+                datetime.fromisoformat(
+                    timestamps.invalid_at.replace("Z", "+00:00")
+                )
+            )
+
+        except ValueError:
+
+            validation_errors.append(
+                f"invalid_at is not parseable ISO 8601; value={timestamps.invalid_at!r}"
+            )
+
+    # only test ordering when both supplied bounds parsed successfully
+    if (
+        valid_at is not None
+        and invalid_at is not None
+        and invalid_at < valid_at
+    ):
 
         validation_errors.append(
             f"impossible temporal interval; valid_at={timestamps.valid_at} "
@@ -788,6 +808,7 @@ async def _extract_edge_timestamps(
 
     except Exception:
         logger.warning('Failed to extract timestamps for edge %s', edge.uuid, exc_info=True)
+        raise
 
 
 def _validate_batch_timestamp_response(
@@ -826,8 +847,12 @@ def _validate_batch_timestamp_response(
 
         seen_edge_ids.add(edge_id)
 
-        # reject impossible temporal intervals before allowing them to update graph state
-        if temporal_bounds.valid_at and temporal_bounds.invalid_at:
+        # reject malformed or impossible temporal bounds before allowing them to update graph state
+        valid_at                    = None
+        invalid_at                  = None
+        timestamp_validation_failed = False
+
+        if temporal_bounds.valid_at:
 
             try:
 
@@ -837,6 +862,18 @@ def _validate_batch_timestamp_response(
                     )
                 )
 
+            except ValueError:
+
+                validation_errors.append(
+                    f"edge_id={edge_id} has unparseable valid_at={temporal_bounds.valid_at!r}"
+                )
+
+                timestamp_validation_failed = True
+
+        if temporal_bounds.invalid_at:
+
+            try:
+
                 invalid_at = ensure_utc(
                     datetime.fromisoformat(
                         temporal_bounds.invalid_at.replace("Z", "+00:00")
@@ -845,21 +882,28 @@ def _validate_batch_timestamp_response(
 
             except ValueError:
 
-                # timestamp parsing remains the responsibility of the application path below;
-                # this validator is concerned only with a parseable but impossible interval
-                pass
+                validation_errors.append(
+                    f"edge_id={edge_id} has unparseable invalid_at={temporal_bounds.invalid_at!r}"
+                )
 
-            else:
+                timestamp_validation_failed = True
 
-                if invalid_at < valid_at:
+        if timestamp_validation_failed:
+            continue
 
-                    validation_errors.append(
-                        f"edge_id={edge_id} has impossible temporal interval; "
-                        f"valid_at={temporal_bounds.valid_at} "
-                        f"invalid_at={temporal_bounds.invalid_at}"
-                    )
+        if (
+            valid_at is not None
+            and invalid_at is not None
+            and invalid_at < valid_at
+        ):
 
-                    continue
+            validation_errors.append(
+                f"edge_id={edge_id} has impossible temporal interval; "
+                f"valid_at={temporal_bounds.valid_at} "
+                f"invalid_at={temporal_bounds.invalid_at}"
+            )
+
+            continue
 
         timestamps_by_edge_id[edge_id] = temporal_bounds
 
@@ -1050,6 +1094,8 @@ async def _extract_edge_timestamps_batch(
             'Failed to extract timestamps for edge batch',
             exc_info=True,
         )
+
+        raise
 
 
 # validate model-returned edge-resolution indexes against the runtime candidate collections

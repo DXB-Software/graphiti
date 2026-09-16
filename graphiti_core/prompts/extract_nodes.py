@@ -57,7 +57,7 @@ class SummarizedEntity(BaseModel):
 class SummarizedEntities(BaseModel):
     summaries: list[SummarizedEntity] = Field(
         ...,
-        description='List of entity summaries. Only include entities that need summary updates.',
+        description='Exactly one entity summary for every entity supplied in ENTITIES.',
     )
 
 
@@ -69,6 +69,7 @@ class Prompt(Protocol):
     extract_attributes: PromptVersion
     extract_summary: PromptVersion
     extract_summaries_batch: PromptVersion
+    extract_summaries_batch_repair: PromptVersion
     extract_entity_summaries_from_episodes: PromptVersion
 
 
@@ -80,6 +81,7 @@ class Versions(TypedDict):
     extract_attributes: PromptFunction
     extract_summary: PromptFunction
     extract_summaries_batch: PromptFunction
+    extract_summaries_batch_repair: PromptFunction
     extract_entity_summaries_from_episodes: PromptFunction
 
 
@@ -533,10 +535,12 @@ Each summary must be under {MAX_SUMMARY_CHARS} characters.
 </ENTITIES>
 
 For each entity, combine relevant information from the MESSAGES with any existing summary content.
-Each entity has an entity_id. For every returned summary, return that exact entity_id unchanged.
+Each entity has an entity_id. Return exactly one summary for EVERY entity in ENTITIES.
+Return each entity_id exactly once and return that exact entity_id unchanged.
+NEVER omit, duplicate, or invent an entity_id.
 The entity name is context only and must never be used as the response identifier.
-Only return summaries for entities that have meaningful information to summarize.
-If an entity has no relevant information in the messages and no existing summary, you may skip it.
+If the messages add no relevant information, return the entity's existing summary unchanged.
+Do not invent information merely to produce a summary.
 """,
         ),
     ]
@@ -640,10 +644,76 @@ existing summary already on the entity.
 {to_prompt_json(context['entities'])}
 </ENTITIES>
 
-Each entity has an entity_id. For every returned summary, return that exact entity_id unchanged.
+Each entity has an entity_id. Return exactly one summary for EVERY entity in ENTITIES.
+Return each entity_id exactly once and return that exact entity_id unchanged.
+NEVER omit, duplicate, or invent an entity_id.
 The entity name is context only and must never be used as the response identifier.
-Only return summaries for entities that have meaningful information to summarize.
-If an entity has no relevant information in the episodes and no existing summary, you may skip it.
+If the episodes add no relevant information, return the entity's existing summary unchanged.
+Do not invent information merely to produce a summary.
+""",
+        ),
+    ]
+
+
+def extract_summaries_batch_repair(context: dict[str, Any]) -> list[Message]:
+
+    use_episode_prompt = bool(context.get('use_episode_prompt'))
+
+    if use_episode_prompt:
+
+        system_prompt = _entity_episode_summary_system_prompt
+        source_name   = 'EPISODES'
+
+    else:
+
+        system_prompt = (
+            'You are repairing an invalid batched entity-summary response. '
+            'Use only the supplied source material and existing entity summaries.'
+        )
+
+        source_name = 'MESSAGES'
+
+    return [
+        Message(
+            role='system',
+            content=system_prompt,
+        ),
+        Message(
+            role='user',
+            content=f"""
+Your previous batched summary response violated the runtime identity constraints.
+
+<{source_name}>
+{to_prompt_json(context['previous_episodes'])}
+{to_prompt_json(context['episode_content'])}
+</{source_name}>
+{_entity_type_descriptions_section(context)}
+<ENTITIES>
+{to_prompt_json(context['entities'])}
+</ENTITIES>
+
+<PREVIOUS RESPONSE>
+{to_prompt_json(context['previous_response'])}
+</PREVIOUS RESPONSE>
+
+<VALIDATION ERRORS>
+{to_prompt_json(context['validation_errors'])}
+</VALIDATION ERRORS>
+
+<EXPECTED ENTITY IDS>
+{to_prompt_json(context['expected_entity_ids'])}
+</EXPECTED ENTITY IDS>
+
+Rules:
+- Return exactly one summary for EVERY EXPECTED ENTITY ID.
+- Return each entity_id exactly once and copy it unchanged.
+- NEVER omit, duplicate, or invent an entity_id.
+- Each summary must be under {MAX_SUMMARY_CHARS} characters.
+- Use only facts supported by the supplied source material or existing summary.
+- If there is no supported information and the existing summary is empty, return an empty summary.
+- Do NOT invent information to fill a missing summary.
+- Return the COMPLETE corrected response.
+- Do not explain the correction.
 """,
         ),
     ]
@@ -655,6 +725,7 @@ versions: Versions = {
     'extract_text': extract_text,
     'extract_summary': extract_summary,
     'extract_summaries_batch': extract_summaries_batch,
+    'extract_summaries_batch_repair': extract_summaries_batch_repair,
     'extract_entity_summaries_from_episodes': extract_entity_summaries_from_episodes,
     'classify_nodes': classify_nodes,
     'extract_attributes': extract_attributes,
