@@ -435,6 +435,43 @@ async def resolve_extracted_edges(
 
     related_edges_lists: list[list[EntityEdge]] = [result.edges for result in related_edges_results]
 
+    # semantic search may legitimately shortlist only part of the endpoint-matched relationship set;
+    # an exact persisted duplicate must never disappear from deterministic resolution because ranking
+    # omitted it, otherwise a second active UUID can be created for the same canonical relationship
+    for extracted_edge, valid_edges, related_edges in zip(
+        extracted_edges,
+        valid_edges_list,
+        related_edges_lists,
+        strict=True,
+    ):
+
+        normalised_extracted_fact = _normalize_string_exact(
+            extracted_edge.fact
+        ) # normalised_extracted_fact
+
+        related_edge_uuids = set()
+
+        for related_edge in related_edges:
+            related_edge_uuids.add(related_edge.uuid)
+
+        for valid_edge in valid_edges:
+
+            exact_match = (
+                valid_edge.source_node_uuid == extracted_edge.source_node_uuid
+                and valid_edge.target_node_uuid == extracted_edge.target_node_uuid
+                and valid_edge.name == extracted_edge.name
+                and _normalize_string_exact(valid_edge.fact) == normalised_extracted_fact
+            ) # exact_match
+
+            if not exact_match:
+                continue
+
+            # inject the exact match only when semantic ranking did not already return it
+            if valid_edge.uuid not in related_edge_uuids:
+                related_edges.insert(0, valid_edge)
+
+            break
+
     edge_invalidation_candidate_results: list[SearchResults] = await semaphore_gather(
         *[
             search(
@@ -848,93 +885,149 @@ async def resolve_extracted_edge(
 
     start = time()
 
-    # Prepare context for LLM with continuous indexing
-    related_edges_context = [{'idx': i, 'fact': edge.fact} for i, edge in enumerate(related_edges)]
+    # build independent 0-based index spaces for duplicate candidates and invalidation candidates;
+    # the model must never infer which collection owns one numeric index from a shared offset
+    related_edges_context = []
 
-    # Invalidation candidates start where duplicate candidates end
-    invalidation_idx_offset = len(related_edges)
-    invalidation_edge_candidates_context = [
-        {'idx': invalidation_idx_offset + i, 'fact': existing_edge.fact}
-        for i, existing_edge in enumerate(existing_edges)
-    ]
+    for edge_index, edge in enumerate(related_edges):
+
+        related_edges_context.append({
+            "idx"  : edge_index,
+            "fact" : edge.fact,
+        })
+
+    invalidation_edge_candidates_context = []
+
+    for edge_index, existing_edge in enumerate(existing_edges):
+
+        invalidation_edge_candidates_context.append({
+            "idx"  : edge_index,
+            "fact" : existing_edge.fact,
+        })
 
     context = {
-        'existing_edges': related_edges_context,
-        'new_edge': extracted_edge.fact,
-        'edge_invalidation_candidates': invalidation_edge_candidates_context,
-    }
+        "existing_edges"               : related_edges_context,
+        "new_edge"                     : extracted_edge.fact,
+        "edge_invalidation_candidates" : invalidation_edge_candidates_context,
+    } # context
+
+    existing_fact_range = "none"
+
+    if related_edges:
+        existing_fact_range = f"0-{len(related_edges) - 1}"
+
+    invalidation_candidate_range = "none"
+
+    if existing_edges:
+        invalidation_candidate_range = f"0-{len(existing_edges) - 1}"
 
     if related_edges or existing_edges:
+
         logger.debug(
-            'Resolving edge: sent %d EXISTING FACTS%s and %d INVALIDATION CANDIDATES%s',
-            len(related_edges),
-            f' (idx 0-{len(related_edges) - 1})' if related_edges else '',
-            len(existing_edges),
-            f' (idx {invalidation_idx_offset}-{invalidation_idx_offset + len(existing_edges) - 1})'
-            if existing_edges
-            else '',
+            f"Resolving edge: sent {len(related_edges)} EXISTING FACTS "
+            f"(idx {existing_fact_range}) and {len(existing_edges)} INVALIDATION CANDIDATES "
+            f"(idx {invalidation_candidate_range})"
         )
 
     llm_response = await llm_client.generate_response(
         prompt_library.dedupe_edges.resolve_edge(context),
         response_model=EdgeDuplicate,
         model_size=ModelSize.small,
-        prompt_name='dedupe_edges.resolve_edge',
-    )
-    response_object = EdgeDuplicate(**llm_response)
-    duplicate_facts = response_object.duplicate_facts
+        prompt_name="dedupe_edges.resolve_edge",
+    ) # llm_response
 
-    # Validate duplicate_facts are in valid range for EXISTING FACTS
-    invalid_duplicates = [i for i in duplicate_facts if i < 0 or i >= len(related_edges)]
+    response_object = EdgeDuplicate(**llm_response)
+
+    duplicate_facts                    = response_object.duplicate_facts
+    contradicted_existing_facts        = response_object.contradicted_existing_facts
+    contradicted_invalidation_facts    = response_object.contradicted_invalidation_candidates
+
+    duplicate_fact_ids = []
+    invalid_duplicates = []
+
+    # duplicate indexes may only address the independently indexed EXISTING FACTS collection
+    for duplicate_fact_id in duplicate_facts:
+
+        if 0 <= duplicate_fact_id < len(related_edges):
+            duplicate_fact_ids.append(duplicate_fact_id)
+
+        else:
+            invalid_duplicates.append(duplicate_fact_id)
+
     if invalid_duplicates:
+
         logger.warning(
-            'LLM returned invalid duplicate_facts idx values %s (valid range: 0-%d for EXISTING FACTS)',
-            invalid_duplicates,
-            len(related_edges) - 1,
+            f"LLM returned invalid duplicate_facts idx values {invalid_duplicates}; "
+            f"EXISTING FACTS count={len(related_edges)}"
         )
 
-    duplicate_fact_ids: list[int] = [i for i in duplicate_facts if 0 <= i < len(related_edges)]
-
     resolved_edge = extracted_edge
+
     for duplicate_fact_id in duplicate_fact_ids:
+
         resolved_edge = related_edges[duplicate_fact_id]
         break
 
     if duplicate_fact_ids and episode is not None:
-        resolved_edge.episodes.append(episode.uuid)
+
+        if episode.uuid not in resolved_edge.episodes:
+            resolved_edge.episodes.append(episode.uuid)
 
     if (
         preserve_existing_attributes
         and resolved_edge.uuid != extracted_edge.uuid
     ):
+
         resolved_edge.attributes = {
             **dict(resolved_edge.attributes or {}),
             **dict(extracted_edge.attributes or {}),
         }
 
-    # Process contradicted facts (continuous indexing across both lists)
-    contradicted_facts: list[int] = response_object.contradicted_facts
-    invalidation_candidates: list[EntityEdge] = []
+    contradicted_existing_fact_ids     = []
+    invalid_contradicted_existing_ids  = []
+    contradicted_invalidation_fact_ids = []
+    invalid_contradicted_invalidation  = []
 
-    # Only process contradictions if there are edges to check against
-    if related_edges or existing_edges:
-        max_valid_idx = len(related_edges) + len(existing_edges) - 1
-        invalid_contradictions = [i for i in contradicted_facts if i < 0 or i > max_valid_idx]
-        if invalid_contradictions:
-            logger.warning(
-                'LLM returned invalid contradicted_facts idx values %s (valid range: 0-%d)',
-                invalid_contradictions,
-                max_valid_idx,
-            )
+    # contradiction indexes from EXISTING FACTS are validated only against that collection
+    for contradicted_fact_id in contradicted_existing_facts:
 
-        # Split contradicted facts into those from related_edges vs existing_edges based on offset
-        for idx in contradicted_facts:
-            if 0 <= idx < len(related_edges):
-                # From EXISTING FACTS (duplicate candidates)
-                invalidation_candidates.append(related_edges[idx])
-            elif invalidation_idx_offset <= idx <= max_valid_idx:
-                # From FACT INVALIDATION CANDIDATES (adjust index by offset)
-                invalidation_candidates.append(existing_edges[idx - invalidation_idx_offset])
+        if 0 <= contradicted_fact_id < len(related_edges):
+            contradicted_existing_fact_ids.append(contradicted_fact_id)
+
+        else:
+            invalid_contradicted_existing_ids.append(contradicted_fact_id)
+
+    if invalid_contradicted_existing_ids:
+
+        logger.warning(
+            f"LLM returned invalid contradicted_existing_facts idx values "
+            f"{invalid_contradicted_existing_ids}; EXISTING FACTS count={len(related_edges)}"
+        )
+
+    # invalidation indexes have their own independent range starting at zero
+    for contradicted_fact_id in contradicted_invalidation_facts:
+
+        if 0 <= contradicted_fact_id < len(existing_edges):
+            contradicted_invalidation_fact_ids.append(contradicted_fact_id)
+
+        else:
+            invalid_contradicted_invalidation.append(contradicted_fact_id)
+
+    if invalid_contradicted_invalidation:
+
+        logger.warning(
+            f"LLM returned invalid contradicted_invalidation_candidates idx values "
+            f"{invalid_contradicted_invalidation}; "
+            f"FACT INVALIDATION CANDIDATES count={len(existing_edges)}"
+        )
+
+    invalidation_candidates = []
+
+    for contradicted_fact_id in contradicted_existing_fact_ids:
+        invalidation_candidates.append(related_edges[contradicted_fact_id])
+
+    for contradicted_fact_id in contradicted_invalidation_fact_ids:
+        invalidation_candidates.append(existing_edges[contradicted_fact_id])
 
     # Only extract structured attributes if the edge's relation_type matches an allowed custom type
     # AND the edge model exists for this node pair signature
