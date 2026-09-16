@@ -69,11 +69,29 @@ class EdgeTimestamps(BaseModel):
     )
 
 
-class BatchEdgeTimestamps(BaseModel):
-    """Temporal bounds for a batch of facts."""
+class BatchEdgeTimestamp(BaseModel):
+    """Temporal bounds extracted for one identified edge in a batch."""
 
-    timestamps: list[EdgeTimestamps] = Field(
-        ..., description='Timestamps for each fact, in the same order as the input facts'
+    edge_id: str = Field(
+        ...,
+        description='Stable edge ID supplied with the input fact. Return this value unchanged.',
+    )
+    valid_at: str | None = Field(
+        None,
+        description='When the fact became true. ISO 8601 with Z suffix (e.g., 2025-04-30T00:00:00Z)',
+    )
+    invalid_at: str | None = Field(
+        None,
+        description='When the fact stopped being true. ISO 8601 with Z suffix (e.g., 2025-04-30T00:00:00Z)',
+    )
+
+
+class BatchEdgeTimestamps(BaseModel):
+    """Temporal bounds for a batch of identified facts."""
+
+    timestamps: list[BatchEdgeTimestamp] = Field(
+        ...,
+        description='Exactly one timestamp result for each supplied edge_id',
     )
 
 
@@ -81,14 +99,18 @@ class Prompt(Protocol):
     edge: PromptVersion
     extract_attributes: PromptVersion
     extract_timestamps: PromptVersion
+    extract_timestamps_repair: PromptVersion
     extract_timestamps_batch: PromptVersion
+    extract_timestamps_batch_repair: PromptVersion
 
 
 class Versions(TypedDict):
     edge: PromptFunction
     extract_attributes: PromptFunction
     extract_timestamps: PromptFunction
+    extract_timestamps_repair: PromptFunction
     extract_timestamps_batch: PromptFunction
+    extract_timestamps_batch_repair: PromptFunction
 
 
 def edge(context: dict[str, Any]) -> list[Message]:
@@ -277,6 +299,52 @@ Rules:
     ]
 
 
+def extract_timestamps_repair(context: dict[str, Any]) -> list[Message]:
+
+    return [
+        Message(
+            role='system',
+            content=(
+                'You are repairing an invalid timestamp extraction response. '
+                'Return only the complete corrected structured response.'
+            ),
+        ),
+        Message(
+            role='user',
+            content=f"""Given the original FACT, REFERENCE TIME, previous response and validation
+errors below, repair the timestamp response.
+
+<FACT>
+{context['fact']}
+</FACT>
+
+<REFERENCE TIME>
+{context['reference_time']}
+</REFERENCE TIME>
+
+<PREVIOUS RESPONSE>
+{to_prompt_json(context['previous_response'])}
+</PREVIOUS RESPONSE>
+
+<VALIDATION ERRORS>
+{to_prompt_json(context['validation_errors'])}
+</VALIDATION ERRORS>
+
+Rules:
+- Re-evaluate valid_at and invalid_at from the FACT and REFERENCE TIME.
+- If both valid_at and invalid_at are present, invalid_at MUST be later than or equal to valid_at.
+- NEVER return an interval where invalid_at is earlier than valid_at.
+- If the ordering is uncertain, leave the uncertain temporal bound null.
+- Leave both fields null if no time is stated or resolvable.
+- Use ISO 8601 with Z suffix.
+- Do NOT invent a date merely to satisfy the validation error.
+- Return the COMPLETE corrected response.
+- Do not explain the correction.
+""",
+        ),
+    ]
+
+
 def extract_timestamps_batch(context: dict[str, Any]) -> list[Message]:
     return [
         Message(
@@ -300,7 +368,13 @@ Rules:
 - Use ISO 8601 with Z suffix (e.g., 2025-04-30T00:00:00Z).
 - Do NOT hallucinate or infer dates from unrelated events.
 
-Return one timestamps entry per fact, in the same order.
+Each FACT contains a stable edge_id.
+
+Return exactly one timestamps entry for every supplied edge_id.
+Copy each edge_id unchanged into its corresponding result.
+NEVER omit, duplicate, or invent an edge_id.
+Ordering is not significant; edge_id identifies the fact.
+If no temporal bound can be determined for a fact, return its edge_id with both timestamps null.
 
 <FACTS>
 {to_prompt_json(context['facts'])}
@@ -310,9 +384,56 @@ Return one timestamps entry per fact, in the same order.
     ]
 
 
+def extract_timestamps_batch_repair(context: dict[str, Any]) -> list[Message]:
+
+    return [
+        Message(
+            role='system',
+            content=(
+                'You are repairing an invalid batch timestamp extraction response. '
+                'Return only the complete corrected structured response.'
+            ),
+        ),
+        Message(
+            role='user',
+            content=f"""Given the original FACTS and validation errors below, repair the previous response.
+
+<FACTS>
+{to_prompt_json(context['facts'])}
+</FACTS>
+
+<EXPECTED_EDGE_IDS>
+{to_prompt_json(context['expected_edge_ids'])}
+</EXPECTED_EDGE_IDS>
+
+<PREVIOUS_RESPONSE>
+{to_prompt_json(context['previous_response'])}
+</PREVIOUS_RESPONSE>
+
+<VALIDATION_ERRORS>
+{to_prompt_json(context['validation_errors'])}
+</VALIDATION_ERRORS>
+
+Rules:
+- Return exactly one timestamps entry for every EXPECTED_EDGE_ID.
+- Copy every edge_id exactly.
+- NEVER omit, duplicate, or invent an edge_id.
+- Preserve valid_at and invalid_at values when they remain supported by the corresponding fact.
+- If no temporal bound can be determined for a fact, return that edge_id with both values null.
+- Do not explain the correction.
+- If both valid_at and invalid_at are present, invalid_at MUST be later than or equal to valid_at.
+- NEVER return an interval where invalid_at is earlier than valid_at.
+- If the ordering is uncertain, leave the uncertain temporal bound null.
+""",
+        ),
+    ]
+
+
 versions: Versions = {
     'edge': edge,
     'extract_attributes': extract_attributes,
     'extract_timestamps': extract_timestamps,
+    'extract_timestamps_repair': extract_timestamps_repair,
     'extract_timestamps_batch': extract_timestamps_batch,
+    'extract_timestamps_batch_repair': extract_timestamps_batch_repair,
 }

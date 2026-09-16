@@ -48,10 +48,12 @@ class EdgeDuplicate(BaseModel):
 
 class Prompt(Protocol):
     resolve_edge: PromptVersion
+    resolve_edge_repair: PromptVersion
 
 
 class Versions(TypedDict):
     resolve_edge: PromptFunction
+    resolve_edge_repair: PromptFunction
 
 
 def resolve_edge(context: dict[str, Any]) -> list[Message]:
@@ -156,4 +158,62 @@ contradicted_invalidation_candidates=[]
     ]
 
 
-versions: Versions = {'resolve_edge': resolve_edge}
+def resolve_edge_repair(context: dict[str, Any]) -> list[Message]:
+
+    return [
+        Message(
+            role="system",
+            content=(
+                "You are repairing an invalid fact deduplication response. "
+                "Return only a complete corrected response matching the response schema."
+            ),
+        ),
+        Message(
+            role="user",
+            content=f"""
+Your previous response violated the runtime constraints for the supplied fact collections.
+
+<EXISTING FACTS>
+{context["existing_edges"]}
+</EXISTING FACTS>
+
+<FACT INVALIDATION CANDIDATES>
+{context["edge_invalidation_candidates"]}
+</FACT INVALIDATION CANDIDATES>
+
+<NEW FACT>
+{context["new_edge"]}
+</NEW FACT>
+
+<PREVIOUS RESPONSE>
+{context["previous_response"]}
+</PREVIOUS RESPONSE>
+
+<VALIDATION ERRORS>
+{context["validation_errors"]}
+</VALIDATION ERRORS>
+
+The legal index ranges are:
+
+duplicate_facts:
+{context["existing_fact_range"]}
+
+contradicted_existing_facts:
+{context["existing_fact_range"]}
+
+contradicted_invalidation_candidates:
+{context["invalidation_candidate_range"]}
+
+If a collection is empty, every response field referring to that collection MUST be [].
+
+Re-evaluate the facts and return the COMPLETE corrected response.
+Do not explain the correction.
+""",
+        ),
+    ]
+
+
+versions: Versions = {
+    "resolve_edge": resolve_edge,
+    "resolve_edge_repair": resolve_edge_repair,
+}

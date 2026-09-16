@@ -37,7 +37,12 @@ from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
 from graphiti_core.prompts import prompt_library
 from graphiti_core.prompts.dedupe_edges import EdgeDuplicate
 from graphiti_core.prompts.extract_edges import Edge as ExtractedEdge
-from graphiti_core.prompts.extract_edges import BatchEdgeTimestamps, EdgeTimestamps, ExtractedEdges
+from graphiti_core.prompts.extract_edges import (
+    BatchEdgeTimestamp,
+    BatchEdgeTimestamps,
+    EdgeTimestamps,
+    ExtractedEdges,
+)
 from graphiti_core.search.search import search
 from graphiti_core.search.search_config import SearchResults
 from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
@@ -647,6 +652,45 @@ def resolve_edge_contradictions(
     return invalidated_edges
 
 
+# validate a single timestamp response before allowing it to update graph state
+def _validate_edge_timestamp_response(
+    timestamps: EdgeTimestamps,
+) -> list[str]:
+
+    validation_errors = []
+
+    if not timestamps.valid_at or not timestamps.invalid_at:
+        return validation_errors
+
+    try:
+
+        valid_at = ensure_utc(
+            datetime.fromisoformat(
+                timestamps.valid_at.replace("Z", "+00:00")
+            )
+        )
+
+        invalid_at = ensure_utc(
+            datetime.fromisoformat(
+                timestamps.invalid_at.replace("Z", "+00:00")
+            )
+        )
+
+    except ValueError:
+
+        # parsing remains handled by the timestamp application path below
+        return validation_errors
+
+    if invalid_at < valid_at:
+
+        validation_errors.append(
+            f"impossible temporal interval; valid_at={timestamps.valid_at} "
+            f"invalid_at={timestamps.invalid_at}"
+        )
+
+    return validation_errors
+
+
 async def _extract_edge_timestamps(
     llm_client: LLMClient,
     edge: EntityEdge,
@@ -676,6 +720,54 @@ async def _extract_edge_timestamps(
             prompt_name='extract_edges.extract_timestamps',
         )
         timestamps = EdgeTimestamps(**llm_response)
+
+        validation_errors = _validate_edge_timestamp_response(
+            timestamps
+        ) # validation_errors
+
+        if validation_errors:
+
+            logger.info(
+                f"[EXTRACT_EDGE_TIMESTAMPS] Timestamp response failed semantic validation; "
+                f"retrying once with explicit feedback: {validation_errors}"
+            )
+
+            repair_context = {
+                **context,
+                "previous_response" : timestamps.model_dump(),
+                "validation_errors" : validation_errors,
+            } # repair_context
+
+            repaired_response = await llm_client.generate_response(
+                prompt_library.extract_edges.extract_timestamps_repair(
+                    repair_context
+                ),
+                response_model=EdgeTimestamps,
+                model_size=ModelSize.small,
+                prompt_name="extract_edges.extract_timestamps_repair",
+            ) # repaired_response
+
+            repaired_timestamps = EdgeTimestamps(**repaired_response)
+
+            repair_validation_errors = _validate_edge_timestamp_response(
+                repaired_timestamps
+            ) # repair_validation_errors
+
+            if repair_validation_errors:
+
+                logger.warning(
+                    f"[EXTRACT_EDGE_TIMESTAMPS] Repaired timestamp response remains invalid; "
+                    f"leaving temporal bounds unset: {repair_validation_errors}"
+                )
+
+                return
+
+            logger.info(
+                "[EXTRACT_EDGE_TIMESTAMPS] Repaired invalid timestamp response"
+            )
+
+            timestamps = repaired_timestamps
+
         if timestamps.valid_at:
             try:
                 edge.valid_at = ensure_utc(
@@ -690,8 +782,96 @@ async def _extract_edge_timestamps(
                 )
             except ValueError:
                 logger.debug(f'Error parsing invalid_at: {timestamps.invalid_at}')
+
+        # enforce the same temporal invariant used by the batch extraction path
+        _clear_impossible_temporal_interval(edge)
+
     except Exception:
         logger.warning('Failed to extract timestamps for edge %s', edge.uuid, exc_info=True)
+
+
+def _validate_batch_timestamp_response(
+    response_object: BatchEdgeTimestamps,
+    batch_edges: list[EntityEdge],
+) -> tuple[dict[str, BatchEdgeTimestamp], list[str]]:
+
+    expected_edge_ids = {
+        edge.uuid
+        for edge in batch_edges
+    }
+
+    timestamps_by_edge_id: dict[str, BatchEdgeTimestamp] = {}
+    validation_errors = []
+    seen_edge_ids = set()
+
+    for temporal_bounds in response_object.timestamps:
+
+        edge_id = temporal_bounds.edge_id
+
+        if edge_id not in expected_edge_ids:
+
+            validation_errors.append(
+                f"unexpected edge_id={edge_id}"
+            )
+
+            continue
+
+        if edge_id in seen_edge_ids:
+
+            validation_errors.append(
+                f"duplicate edge_id={edge_id}"
+            )
+
+            continue
+
+        seen_edge_ids.add(edge_id)
+
+        # reject impossible temporal intervals before allowing them to update graph state
+        if temporal_bounds.valid_at and temporal_bounds.invalid_at:
+
+            try:
+
+                valid_at = ensure_utc(
+                    datetime.fromisoformat(
+                        temporal_bounds.valid_at.replace("Z", "+00:00")
+                    )
+                )
+
+                invalid_at = ensure_utc(
+                    datetime.fromisoformat(
+                        temporal_bounds.invalid_at.replace("Z", "+00:00")
+                    )
+                )
+
+            except ValueError:
+
+                # timestamp parsing remains the responsibility of the application path below;
+                # this validator is concerned only with a parseable but impossible interval
+                pass
+
+            else:
+
+                if invalid_at < valid_at:
+
+                    validation_errors.append(
+                        f"edge_id={edge_id} has impossible temporal interval; "
+                        f"valid_at={temporal_bounds.valid_at} "
+                        f"invalid_at={temporal_bounds.invalid_at}"
+                    )
+
+                    continue
+
+        timestamps_by_edge_id[edge_id] = temporal_bounds
+
+    missing_edge_ids = expected_edge_ids - seen_edge_ids
+
+    for edge_id in sorted(missing_edge_ids):
+
+        validation_errors.append(
+            f"missing edge_id={edge_id}"
+        )
+
+    return timestamps_by_edge_id, validation_errors
 
 
 async def _extract_edge_timestamps_batch(
@@ -713,8 +893,6 @@ async def _extract_edge_timestamps_batch(
     if not missing_edges:
         return
 
-    timestamps: list[EdgeTimestamps] = []
-
     try:
         
         for batch_start in range(0, len(missing_edges), EDGE_TIMESTAMP_BATCH_SIZE):
@@ -723,69 +901,148 @@ async def _extract_edge_timestamps_batch(
             ]
 
             context = {
-                'facts': [
+                "facts": [
                     {
-                        'fact': edge.fact,
-                        'reference_time': episode.valid_at.isoformat(),
+                        "edge_id"        : edge.uuid,
+                        "fact"           : edge.fact,
+                        "reference_time" : episode.valid_at.isoformat(),
                     }
                     for edge in batch_edges
                 ],
-            }
+            } # context
 
+            # ask the small model for the normal batch timestamp extraction
             llm_response = await llm_client.generate_response(
                 prompt_library.extract_edges.extract_timestamps_batch(context),
                 response_model=BatchEdgeTimestamps,
                 model_size=ModelSize.small,
-                prompt_name='extract_edges.extract_timestamps_batch',
-            )
+                prompt_name="extract_edges.extract_timestamps_batch",
+            ) # llm_response
 
-            batch_timestamps = BatchEdgeTimestamps(**llm_response).timestamps
+            response_object = BatchEdgeTimestamps(**llm_response)
 
-            if len(batch_timestamps) != len(batch_edges):
-                logger.warning(
-                    f'Batch timestamp extraction returned {len(batch_timestamps)} results '
-                    f'for {len(batch_edges)} edges; leaving temporal bounds unset'
+            timestamps_by_edge_id, validation_errors = _validate_batch_timestamp_response(
+                response_object,
+                batch_edges,
+            ) # timestamps_by_edge_id, validation_errors
+
+            if validation_errors:
+
+                logger.info(
+                    f"[EXTRACT_EDGE_TIMESTAMPS_BATCH] Batch timestamp response failed semantic "
+                    f"validation; retrying once with explicit feedback: {validation_errors}"
                 )
-                return
 
-            timestamps.extend(batch_timestamps)
+                repair_context = {
+                    **context,
+                    "expected_edge_ids" : [
+                        edge.uuid
+                        for edge in batch_edges
+                    ],
+                    "previous_response" : response_object.model_dump(),
+                    "validation_errors" : validation_errors,
+                } # repair_context
 
-        for edge, temporal_bounds in zip(missing_edges, timestamps, strict=True):
+                repaired_response = await llm_client.generate_response(
+                    prompt_library.extract_edges.extract_timestamps_batch_repair(
+                        repair_context
+                    ),
+                    response_model=BatchEdgeTimestamps,
+                    model_size=ModelSize.small,
+                    prompt_name="extract_edges.extract_timestamps_batch_repair",
+                ) # repaired_response
 
-            if temporal_bounds.valid_at:
+                repaired_object = BatchEdgeTimestamps(**repaired_response)
 
-                try:
+                repaired_by_edge_id, repair_validation_errors = (
+                    _validate_batch_timestamp_response(
+                        repaired_object,
+                        batch_edges,
+                    )
+                ) # repaired_by_edge_id, repair_validation_errors
 
-                    edge.valid_at = ensure_utc(
-                        datetime.fromisoformat(
-                            temporal_bounds.valid_at.replace('Z', '+00:00')
+                if repair_validation_errors:
+
+                    logger.warning(
+                        f"[EXTRACT_EDGE_TIMESTAMPS_BATCH] Repaired batch timestamp response "
+                        f"remains invalid; falling back only for unresolved edges: "
+                        f"{repair_validation_errors}"
+                    )
+
+                else:
+
+                    logger.info(
+                        "[EXTRACT_EDGE_TIMESTAMPS_BATCH] Repaired invalid batch timestamp response"
+                    )
+
+                # prefer every valid result returned by the repair while retaining valid first-attempt
+                # results for any edge the repair still failed to return
+                timestamps_by_edge_id.update(
+                    repaired_by_edge_id
+                )
+
+            # apply every valid timestamp result by stable edge ID rather than list position
+            unresolved_edges = []
+
+            for edge in batch_edges:
+
+                temporal_bounds = timestamps_by_edge_id.get(
+                    edge.uuid
+                )
+
+                if temporal_bounds is None:
+
+                    unresolved_edges.append(edge)
+                    continue
+
+                if temporal_bounds.valid_at:
+
+                    try:
+
+                        edge.valid_at = ensure_utc(
+                            datetime.fromisoformat(
+                                temporal_bounds.valid_at.replace("Z", "+00:00")
+                            )
                         )
-                    )
 
-                except ValueError:
+                    except ValueError:
 
-                    logger.debug(
-                        f'Error parsing valid_at: {temporal_bounds.valid_at}'
-                    )
-
-            if temporal_bounds.invalid_at:
-
-                try:
-
-                    edge.invalid_at = ensure_utc(
-                        datetime.fromisoformat(
-                            temporal_bounds.invalid_at.replace('Z', '+00:00')
+                        logger.debug(
+                            f"Error parsing valid_at: {temporal_bounds.valid_at}"
                         )
-                    )
 
-                except ValueError:
+                if temporal_bounds.invalid_at:
 
-                    logger.debug(
-                        f'Error parsing invalid_at: {temporal_bounds.invalid_at}'
-                    )
+                    try:
 
-            # never allow probabilistic timestamp extraction to create an impossible graph interval
-            _clear_impossible_temporal_interval(edge)
+                        edge.invalid_at = ensure_utc(
+                            datetime.fromisoformat(
+                                temporal_bounds.invalid_at.replace("Z", "+00:00")
+                            )
+                        )
+
+                    except ValueError:
+
+                        logger.debug(
+                            f"Error parsing invalid_at: {temporal_bounds.invalid_at}"
+                        )
+
+                # never allow probabilistic timestamp extraction to create an impossible graph interval
+                _clear_impossible_temporal_interval(edge)
+
+            # if the repair still omitted an edge, fall back only for that unresolved edge
+            for unresolved_edge in unresolved_edges:
+
+                logger.warning(
+                    f"[EXTRACT_EDGE_TIMESTAMPS_BATCH] Falling back to single-edge timestamp "
+                    f"extraction for unresolved edge {unresolved_edge.uuid}"
+                )
+
+                await _extract_edge_timestamps(
+                    llm_client,
+                    unresolved_edge,
+                    episode,
+                )
 
     except Exception:
 
@@ -793,6 +1050,58 @@ async def _extract_edge_timestamps_batch(
             'Failed to extract timestamps for edge batch',
             exc_info=True,
         )
+
+
+# validate model-returned edge-resolution indexes against the runtime candidate collections
+def _validate_edge_resolution_response(
+    response_object: EdgeDuplicate,
+    related_edges: list[EntityEdge],
+    existing_edges: list[EntityEdge],
+) -> list[str]:
+
+    validation_errors = []
+
+    invalid_duplicate_ids = [
+        duplicate_fact_id
+        for duplicate_fact_id in response_object.duplicate_facts
+        if not 0 <= duplicate_fact_id < len(related_edges)
+    ]
+
+    if invalid_duplicate_ids:
+
+        validation_errors.append(
+            f"duplicate_facts idx values {invalid_duplicate_ids} are invalid; "
+            f"EXISTING FACTS count={len(related_edges)}"
+        )
+
+    invalid_contradicted_existing_ids = [
+        contradicted_fact_id
+        for contradicted_fact_id in response_object.contradicted_existing_facts
+        if not 0 <= contradicted_fact_id < len(related_edges)
+    ]
+
+    if invalid_contradicted_existing_ids:
+
+        validation_errors.append(
+            f"contradicted_existing_facts idx values {invalid_contradicted_existing_ids} are invalid; "
+            f"EXISTING FACTS count={len(related_edges)}"
+        )
+
+    invalid_contradicted_invalidation_ids = [
+        contradicted_fact_id
+        for contradicted_fact_id in response_object.contradicted_invalidation_candidates
+        if not 0 <= contradicted_fact_id < len(existing_edges)
+    ]
+
+    if invalid_contradicted_invalidation_ids:
+
+        validation_errors.append(
+            f"contradicted_invalidation_candidates idx values "
+            f"{invalid_contradicted_invalidation_ids} are invalid; "
+            f"FACT INVALIDATION CANDIDATES count={len(existing_edges)}"
+        )
+
+    return validation_errors
 
 
 async def resolve_extracted_edge(
@@ -929,6 +1238,7 @@ async def resolve_extracted_edge(
             f"(idx {invalidation_candidate_range})"
         )
 
+    # ask the small model for the normal edge-resolution decision
     llm_response = await llm_client.generate_response(
         prompt_library.dedupe_edges.resolve_edge(context),
         response_model=EdgeDuplicate,
@@ -937,6 +1247,61 @@ async def resolve_extracted_edge(
     ) # llm_response
 
     response_object = EdgeDuplicate(**llm_response)
+
+    validation_errors = _validate_edge_resolution_response(
+        response_object,
+        related_edges,
+        existing_edges,
+    ) # validation_errors
+
+    if validation_errors:
+
+        logger.info(
+            f"[RESOLVE_EXTRACTED_EDGE] Edge-resolution response failed semantic validation; "
+            f"retrying once with explicit feedback: {validation_errors}"
+        )
+
+        repair_context = {
+            **context,
+            "previous_response"            : response_object.model_dump(),
+            "validation_errors"            : validation_errors,
+            "existing_fact_range"          : existing_fact_range,
+            "invalidation_candidate_range" : invalidation_candidate_range,
+        } # repair_context
+
+        repaired_response = await llm_client.generate_response(
+            prompt_library.dedupe_edges.resolve_edge_repair(
+                repair_context
+            ),
+            response_model=EdgeDuplicate,
+            model_size=ModelSize.small,
+            prompt_name="dedupe_edges.resolve_edge_repair",
+        ) # repaired_response
+
+        repaired_object = EdgeDuplicate(**repaired_response)
+
+        repair_validation_errors = _validate_edge_resolution_response(
+            repaired_object,
+            related_edges,
+            existing_edges,
+        ) # repair_validation_errors
+
+        if repair_validation_errors:
+
+            logger.warning(
+                f"[RESOLVE_EXTRACTED_EDGE] Repaired edge-resolution response remains invalid; "
+                f"falling back to deterministic index filtering: {repair_validation_errors}"
+            )
+
+        else:
+
+            logger.info(
+                "[RESOLVE_EXTRACTED_EDGE] Repaired invalid edge-resolution response"
+            )
+
+        # whether valid or not, the repair response supersedes the first response;
+        # the existing deterministic filtering below remains the final safety boundary
+        response_object = repaired_object
 
     duplicate_facts                    = response_object.duplicate_facts
     contradicted_existing_facts        = response_object.contradicted_existing_facts
@@ -957,8 +1322,8 @@ async def resolve_extracted_edge(
     if invalid_duplicates:
 
         logger.warning(
-            f"LLM returned invalid duplicate_facts idx values {invalid_duplicates}; "
-            f"EXISTING FACTS count={len(related_edges)}"
+            f"[RESOLVE_EXTRACTED_EDGE] Rejecting invalid duplicate_facts idx values "
+            f"{invalid_duplicates} after repair; EXISTING FACTS count={len(related_edges)}"
         )
 
     resolved_edge = extracted_edge
@@ -1000,8 +1365,9 @@ async def resolve_extracted_edge(
     if invalid_contradicted_existing_ids:
 
         logger.warning(
-            f"LLM returned invalid contradicted_existing_facts idx values "
-            f"{invalid_contradicted_existing_ids}; EXISTING FACTS count={len(related_edges)}"
+            f"[RESOLVE_EXTRACTED_EDGE] Rejecting invalid contradicted_existing_facts idx values "
+            f"{invalid_contradicted_existing_ids} after repair; "
+            f"EXISTING FACTS count={len(related_edges)}"
         )
 
     # invalidation indexes have their own independent range starting at zero
@@ -1016,8 +1382,8 @@ async def resolve_extracted_edge(
     if invalid_contradicted_invalidation:
 
         logger.warning(
-            f"LLM returned invalid contradicted_invalidation_candidates idx values "
-            f"{invalid_contradicted_invalidation}; "
+            f"[RESOLVE_EXTRACTED_EDGE] Rejecting invalid contradicted_invalidation_candidates "
+            f"idx values {invalid_contradicted_invalidation} after repair; "
             f"FACT INVALIDATION CANDIDATES count={len(existing_edges)}"
         )
 
