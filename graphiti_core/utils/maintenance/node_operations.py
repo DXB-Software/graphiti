@@ -884,8 +884,17 @@ async def _extract_entity_summaries_batch(
             edge_facts = '\n'.join(edge.fact for edge in node_edges if edge.fact)
             summary_with_edges = f'{summary_with_edges}\n{edge_facts}'.strip()
 
+        # a summary containing only the entity name carries no useful information and must be regenerated
+        summary_is_name_only = (
+            _normalize_string_exact(node.summary) == _normalize_string_exact(node.name)
+        )
+
         # If summary is close to the persisted limit, use it directly (append edge facts, no LLM call)
-        if summary_with_edges and len(summary_with_edges) <= MAX_SUMMARY_CHARS * 2:
+        if (
+            summary_with_edges
+            and len(summary_with_edges) <= MAX_SUMMARY_CHARS * 2
+            and not summary_is_name_only
+        ):
             node.summary = summary_with_edges
             continue
 
