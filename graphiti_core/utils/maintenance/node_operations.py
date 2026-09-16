@@ -942,12 +942,13 @@ async def _process_summary_flight(
     # Build context for batch summarization
     entities_context = [
         {
+            'entity_id': entity_id,
             'name': node.name,
             'summary': node.summary,
             'entity_types': node.labels,
             'attributes': node.attributes,
         }
-        for node in nodes
+        for entity_id, node in enumerate(nodes)
     ]
 
     if episode is None:
@@ -992,27 +993,44 @@ async def _process_summary_flight(
         prompt_name=prompt_name,
     )
 
-    # Build case-insensitive name -> nodes mapping (handles duplicates)
-    name_to_nodes: dict[str, list[EntityNode]] = {}
-    for node in nodes:
-        key = node.name.lower()
-        if key not in name_to_nodes:
-            name_to_nodes[key] = []
-        name_to_nodes[key].append(node)
+    # map the stable prompt IDs back to the exact nodes supplied in this summary flight
+    nodes_by_entity_id = {
+        entity_id: node
+        for entity_id, node in enumerate(nodes)
+    }
 
-    # Apply summaries from LLM response
-    summaries_response = SummarizedEntities(**llm_response)
+    summaries_response   = SummarizedEntities(**llm_response)
+    processed_entity_ids = set()
+
     for summarized_entity in summaries_response.summaries:
-        matching_nodes = name_to_nodes.get(summarized_entity.name.lower(), [])
-        if matching_nodes:
-            truncated_summary = truncate_at_sentence(summarized_entity.summary, MAX_SUMMARY_CHARS)
-            for node in matching_nodes:
-                node.summary = truncated_summary
-        else:
+
+        entity_id = summarized_entity.entity_id
+
+        if entity_id in processed_entity_ids:
+
             logger.warning(
-                'LLM returned summary for unknown entity (first 30 chars): %.30s',
-                summarized_entity.name,
+                f"LLM returned duplicate summary for entity_id={entity_id}; ignoring duplicate"
             )
+
+            continue
+
+        node = nodes_by_entity_id.get(entity_id)
+
+        if node is None:
+
+            logger.warning(
+                f"LLM returned summary for invalid entity_id={entity_id}; "
+                f"valid entity count={len(nodes)}"
+            )
+
+            continue
+
+        processed_entity_ids.add(entity_id)
+
+        node.summary = truncate_at_sentence(
+            summarized_entity.summary,
+            MAX_SUMMARY_CHARS,
+        )
 
 
 def _build_episode_context(

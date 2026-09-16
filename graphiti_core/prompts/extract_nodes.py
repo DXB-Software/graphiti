@@ -47,7 +47,10 @@ class EntitySummary(BaseModel):
 
 
 class SummarizedEntity(BaseModel):
-    name: str = Field(..., description='Name of the entity being summarized')
+    entity_id: int = Field(
+        ...,
+        description='Stable entity ID supplied in ENTITIES. Return this value unchanged.',
+    )
     summary: str = Field(..., description='Updated summary for the entity')
 
 
@@ -530,6 +533,8 @@ Each summary must be under {MAX_SUMMARY_CHARS} characters.
 </ENTITIES>
 
 For each entity, combine relevant information from the MESSAGES with any existing summary content.
+Each entity has an entity_id. For every returned summary, return that exact entity_id unchanged.
+The entity name is context only and must never be used as the response identifier.
 Only return summaries for entities that have meaningful information to summarize.
 If an entity has no relevant information in the messages and no existing summary, you may skip it.
 """,
@@ -635,6 +640,8 @@ existing summary already on the entity.
 {to_prompt_json(context['entities'])}
 </ENTITIES>
 
+Each entity has an entity_id. For every returned summary, return that exact entity_id unchanged.
+The entity name is context only and must never be used as the response identifier.
 Only return summaries for entities that have meaningful information to summarize.
 If an entity has no relevant information in the episodes and no existing summary, you may skip it.
 """,
